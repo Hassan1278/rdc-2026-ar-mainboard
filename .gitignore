@@ -1,0 +1,17 @@
+# Keep local helper scripts and documentation out of GitHub.
+README.md
+build.sh
+flash.sh
+
+# STM32 / CMake build output (regenerable).
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+
+# Local IDE state and macOS archive metadata.
+.settings/
+.DS_Store
+__MACOSX/
+._*
