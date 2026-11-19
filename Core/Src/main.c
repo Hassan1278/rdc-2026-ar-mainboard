@@ -111,14 +111,13 @@ static void key1_show(const char *phase) {
 
 /* ---- Key 1 -------------------------------------------------------------------------
  * 1. START    1 s still; record US2-US3 (rear) = the robot's straight angle.
- * 2. FORWARD  line PID (PID_FWD) at BASE_SPEED, APPROACH_SPEED inside APPROACH_MM;
+ * 2. TO KEY   line PID at BASE_SPEED, APPROACH_SPEED inside APPROACH_MM;
  *             stop when US1 (front) < US_STOP_MM twice in a row.
  * 3. PAUSE    1 s still, rear ultrasonics settle.
- * 4. SQUARE   turn on the spot until US2-US3 matches the start angle again.
- * 5. BACK     line PID (PID_BACK) at BACK_SPEED + rear-ultrasonic heading correction
- *             (keep the start angle); stop when US2/US3 < BACK_STOP_MM twice in a row,
- *             or at the encoder backstop.
- * Line reading (both ways): middle sensors first, outer only if both middle are off,
+ * 4. SQUARE   turn on the spot until US2-US3 matches the start angle (for the key).
+ * 5. TURN     on the spot until the IR leaves the line, then until it finds it again.
+ * 6. RETURN   exactly step 2 again: same line PID, same slow approach, same stop.
+ * Line reading: middle sensors first, outer only if both middle are off,
  * 3+ black (junction) = straight, line lost = keep steering toward the last side.
  * ------------------------------------------------------------------------------------ */
 #define BASE_SPEED  25.0f  /* % before gearing; J1 gets 2x this */
@@ -126,75 +125,50 @@ static void key1_show(const char *phase) {
 #define J3_GAIN     1.0f
 #define LINE_KP     -2.0f  /* steering toward the line (small steps); negative = J1 is the right wheel */
 #define LINE_KD     -6.0f  /* damping: brakes the turn as the line comes back to centre. Same sign as LINE_KP */
-#define LINE_KI     0.0f   /* forward I: off, forward already holds the line */
-#define LINE_I_MAX  0.0f   /* cap on the forward I part, % */
 #define LINE_DT_MS  5      /* steering update period, ms: small steps, often */
 #define LINE_SLEW   1.0f   /* max steering change per update, % (5 ms -> 0 to full turn in 100 ms) */
 #define LINE_TURN_MAX 8.0f /* steering limit: small, so it nearly drives straight */
-#define US_STOP_MM  90     /* forward stops this close to the key holder (80-100 mm) */
-#define APPROACH_MM 400    /* inside this, forward slows down for a precise stop (IR stays on) */
-#define APPROACH_SPEED 15.0f /* forward speed inside APPROACH_MM */
-#define TURN_PAUSE_MS 1000 /* standstill between forward and reverse */
-#define BACK_SPEED  15.0f  /* slower on the way back */
-#define BACK_STOP_MM 150   /* reverse stops this close to the back wall */
-/* Reverse line following: the same PID as forward with its own gains. (Inverting both
- * the sensor reading and the steering cancels out, so it is the same function.) */
-#define BACK_KP     -3.0f  /* reverse P; negative tested (+ circled off) */
-#define BACK_KI     -4.0f  /* reverse I, same sign: builds up against a steady pull (motor imbalance) */
-#define BACK_I_MAX  6.0f   /* cap on the reverse I part, %: stops it winding up */
-#define BACK_KD     -12.0f /* reverse D, same sign as BACK_KP: damping against the growing drift */
-#define BACK_SLEW   0.5f   /* reverse step per 5 ms: half of forward's 1.0, 0 to full in 60 ms */
-#define BACK_TURN_MAX 8.0f /* reverse steering limit (line + ultrasonic together) */
-#define BACK_US_K   0.1f   /* reverse: % steering per mm the rear US2-US3 difference is off the start angle */
-#define BACK_US_MAX 5.0f   /* cap on that ultrasonic correction, % */
-#define BACK_RANGE  1.5f   /* encoder backstop: reverse at most this x the forward distance */
-#define ALIGN_SPEED 10.0f  /* % pivot speed while squaring up at the target */
+#define US_STOP_MM  90     /* stop this close to the wall ahead (key holder / start), 80-100 mm */
+#define APPROACH_MM 400    /* inside this, slow down for a precise stop (IR stays on) */
+#define APPROACH_SPEED 15.0f /* speed inside APPROACH_MM */
+#define TURN_PAUSE_MS 1000 /* standstill before the turn */
+#define TURN_SPEED  12.0f  /* % pivot speed for the turn */
+#define TURN_MAX_MS 8000   /* safety: stop turning after this if the line is never found */
+#define ALIGN_SPEED 10.0f  /* % pivot speed while squaring up at the key */
 #define ALIGN_SIGN  -1.0f  /* pivot direction; flip if it turns away from square (tested: -1) */
 #define ALIGN_TOL_MM 10    /* US2-US3 within this of the start difference = square */
 #define ALIGN_MAX_MS 3000  /* give up squaring after this */
 #define US_EMA_A    0.5f   /* rear ultrasonic smoothing: 1 = none, smaller = smoother but slower */
 
 static float line_err;     /* -2 = line far left .. +2 = line far right; kept if the line is lost */
-/* Straight-only following: while a middle sensor sees the line, the outer sensors
- * are ignored, so a junction branch touching LL/RR can't steer it off the straight.
- * The outer sensors only steer when the line has slipped off both middle ones. */
 static float line_hist[4]; /* last 4 errors, so D measures the change over 20 ms */
 static unsigned line_hi;
 static float line_turn;
-static float line_i;       /* accumulated I part, % */
 static uint32_t line_ms;
 
-typedef struct { float kp, ki, kd, slew, turn_max, i_max; } line_pid_t;
-static const line_pid_t PID_FWD  = {LINE_KP, LINE_KI, LINE_KD, LINE_SLEW, LINE_TURN_MAX, LINE_I_MAX};
-static const line_pid_t PID_BACK = {BACK_KP, BACK_KI, BACK_KD, BACK_SLEW, BACK_TURN_MAX, BACK_I_MAX};
-
-/* Fresh steering state, before each drive segment. */
+/* Fresh steering state, before each drive. */
 static void line_reset(void) {
-  line_err = line_turn = line_i = 0;
+  line_err = line_turn = 0;
   line_hist[0] = line_hist[1] = line_hist[2] = line_hist[3] = 0;
   line_hi = 0;
   line_ms = 0;
 }
 
-/* Reads the IR and updates line_err. Returns false if no sensor sees the line.
- * Junction: 3+ black sensors reads as centred (straight), so a branch can't pull it
- * off. Every other reading is followed normally, straight away. */
-static bool line_read(void) {
+/* Reads the IR and updates line_err. Middle sensors first: the outer ones only count
+ * when the line has left both middle ones, so a junction branch touching LL/RR can't
+ * steer it. 3+ black (junction) reads as straight. Nothing seen: keep the last value. */
+static void line_read(void) {
   IR_Update(&ir);
   bool ll = ir.black[IR_LEFTMOST], lm = ir.black[IR_LEFT_MIDDLE];
   bool rm = ir.black[IR_RIGHT_MIDDLE], rr = ir.black[IR_RIGHTMOST];
   if ((int)ll + (int)lm + (int)rm + (int)rr >= 3) line_err = 0.0f;  /* junction: straight */
-  else if (lm || rm)       line_err = (float)rm - (float)lm;  /* -1, 0 (centred) or +1 */
+  else if (lm || rm)  line_err = (float)rm - (float)lm;  /* -1, 0 (centred) or +1 */
   else if (ll && !rr) line_err = -2.0f;                  /* slipped far left */
   else if (rr && !ll) line_err = 2.0f;                   /* slipped far right */
-  /* nothing, or only both outer sensors: keep the last value */
-  return ll || lm || rm || rr;
 }
 
-/* PID line following for both directions (base > 0 forward, < 0 reverse), recalculated
- * every LINE_DT_MS. If the line is lost, line_err keeps its last value, so it keeps
- * steering toward the side the line was last seen on until it finds it again. */
-static void line_drive(float base, const line_pid_t *c, float extra) {
+/* PD line following, recalculated every LINE_DT_MS. */
+static void line_drive(float base) {
   if (HAL_GetTick() - line_ms >= LINE_DT_MS) {
     line_ms = HAL_GetTick();
     line_read();
@@ -202,24 +176,17 @@ static void line_drive(float base, const line_pid_t *c, float extra) {
     line_hist[line_hi] = line_err;
     line_hi = (line_hi + 1) % 4;
 
-    line_i += c->ki * line_err * (LINE_DT_MS / 1000.0f);   /* I: % per second of error */
-    if (line_i > c->i_max) line_i = c->i_max;
-    if (line_i < -c->i_max) line_i = -c->i_max;
+    float target = LINE_KP * line_err + LINE_KD * change;
+    if (target > LINE_TURN_MAX) target = LINE_TURN_MAX;
+    if (target < -LINE_TURN_MAX) target = -LINE_TURN_MAX;
 
-    float target = c->kp * line_err + line_i + c->kd * change;
-    if (target > c->turn_max) target = c->turn_max;
-    if (target < -c->turn_max) target = -c->turn_max;
-
-    /* Move toward the target by at most slew per update: small, frequent steps. */
-    if (target > line_turn + c->slew)      line_turn += c->slew;
-    else if (target < line_turn - c->slew) line_turn -= c->slew;
-    else                                   line_turn = target;
+    /* Move toward the target by at most LINE_SLEW per update: small, frequent steps. */
+    if (target > line_turn + LINE_SLEW)      line_turn += LINE_SLEW;
+    else if (target < line_turn - LINE_SLEW) line_turn -= LINE_SLEW;
+    else                                     line_turn = target;
   }
-  float turn = line_turn + extra;              /* line PID + extra (rear ultrasonics) */
-  if (turn > c->turn_max) turn = c->turn_max;
-  if (turn < -c->turn_max) turn = -c->turn_max;
-  ELCP_Motor_SetSpeed(MOTOR_J1, J1_GAIN * (base + turn));
-  ELCP_Motor_SetSpeed(MOTOR_J3, J3_GAIN * (base - turn));
+  ELCP_Motor_SetSpeed(MOTOR_J1, J1_GAIN * (base + line_turn));
+  ELCP_Motor_SetSpeed(MOTOR_J3, J3_GAIN * (base - line_turn));
 }
 
 /* Rear ultrasonics US2/US3, each smoothed by an EMA. rear_poll pings one of them
@@ -248,11 +215,32 @@ static bool rear_poll(void) {
 }
 static bool rear_ok(unsigned i) { return rear[i] >= 0 && HAL_GetTick() - rear_ms[i] < 300; }
 
-static void key1(void) {
+/* Follow the line to the wall ahead: slow down inside APPROACH_MM, stop when the front
+ * ultrasonic US1 reads under US_STOP_MM twice in a row. Used for both legs. */
+static void drive_to_wall(const char *phase) {
   line_reset();
-  uint32_t wait = HAL_GetTick();             /* 1 s after the press before moving */
+  int close = 0;
+  uint32_t last_us = 0;
+  float speed = BASE_SPEED;
+  while (close < 2) {
+    line_drive(speed);
+    if (HAL_GetTick() - last_us >= 60) {
+      last_us = HAL_GetTick();
+      int32_t d = Ultrasonic_ReadMm(0);   /* US1, front */
+      us_mm[0] = d;
+      close = (d >= 0 && d < US_STOP_MM) ? close + 1 : 0;
+      if (d >= 0 && d < APPROACH_MM) speed = APPROACH_SPEED;  /* slow final approach, stays slow */
+    }
+    key1_show(phase);
+  }
+  ELCP_Motor_Stop(MOTOR_J1);
+  ELCP_Motor_Stop(MOTOR_J3);
+}
+
+static void key1(void) {
+  uint32_t t = HAL_GetTick();                /* 1 s after the press before moving */
   rear_reset();
-  while (HAL_GetTick() - wait < 1000) {
+  while (HAL_GetTick() - t < 1000) {
     rear_poll();
     key1_show("K1 START");
   }
@@ -260,43 +248,22 @@ static void key1(void) {
    * read equal when square (mounting, wall), so squaring up aims for this difference. */
   float square_diff = (rear_ok(0) && rear_ok(1)) ? rear[0] - rear[1] : 0;
 
-  const ELCP_Motor_State_t *m1 = ELCP_Motor_GetState(MOTOR_J1);
-  const ELCP_Motor_State_t *m3 = ELCP_Motor_GetState(MOTOR_J3);
-  int32_t s1 = m1->pulse_count, s3 = m3->pulse_count;   /* encoder counts at the start */
+  drive_to_wall("K1 TO KEY");
 
-  /* Forward, following the line, until 2 ultrasonic readings in a row are closer than US_STOP_MM. */
-  int close = 0;
-  uint32_t last_us = 0;
-  float fwd_speed = BASE_SPEED;
-  while (close < 2) {
-    line_drive(fwd_speed, &PID_FWD, 0);
-    if (HAL_GetTick() - last_us >= 60) {
-      last_us = HAL_GetTick();
-      int32_t d = Ultrasonic_ReadMm(0);   /* US1, front */
-      us_mm[0] = d;
-      close = (d >= 0 && d < US_STOP_MM) ? close + 1 : 0;
-      if (d >= 0 && d < APPROACH_MM) fwd_speed = APPROACH_SPEED;  /* slow final approach, stays slow */
-    }
-    key1_show("K1 FORWARD");
-  }
-  /* Full stop before reversing, so the forward motion has died out. */
-  ELCP_Motor_Stop(MOTOR_J1);
-  ELCP_Motor_Stop(MOTOR_J3);
-  int32_t f1 = m1->pulse_count - s1, f3 = m3->pulse_count - s3;  /* forward pulses per wheel */
   /* Pause standing still, but keep pinging the rear ultrasonics so their smoothed
    * values are settled before squaring up starts (a plain HAL_Delay sends no pings). */
   rear_reset();
-  uint32_t pause = HAL_GetTick();
-  while (HAL_GetTick() - pause < TURN_PAUSE_MS) {
+  t = HAL_GetTick();
+  while (HAL_GetTick() - t < TURN_PAUSE_MS) {
     rear_poll();
     key1_show("K1 PAUSE");
   }
 
-  /* Square up on the spot: pivot slowly until US2 and US3 agree within
-   * ALIGN_TOL_MM for 3 fresh readings in a row (or give up after ALIGN_MAX_MS). */
-  uint32_t t0 = HAL_GetTick();
+  /* Square up on the spot (for the key): pivot slowly until US2-US3 matches the start
+   * angle within ALIGN_TOL_MM for 3 fresh readings in a row (or give up after ALIGN_MAX_MS). */
+  t = HAL_GetTick();
   int square = 0;
-  while (square < 3 && HAL_GetTick() - t0 < ALIGN_MAX_MS) {
+  while (square < 3 && HAL_GetTick() - t < ALIGN_MAX_MS) {
     bool fresh = rear_poll();
     float pivot = 0;
     if (rear_ok(0) && rear_ok(1)) {
@@ -313,36 +280,27 @@ static void key1(void) {
   ELCP_Motor_Stop(MOTOR_J3);
   HAL_Delay(200);
 
-  /* Reverse with the same line following as forward, with the reverse PID gains.
-   * Stops when the rear ultrasonics read under BACK_STOP_MM twice in a row, or at the
-   * encoder backstop of BACK_RANGE x the forward distance. */
-  int32_t backstop = (int32_t)(BACK_RANGE * (float)(f1 + f3));
-  int32_t b1 = m1->pulse_count, b3 = m3->pulse_count;
-  int near = 0;
-  float us_turn = 0;                          /* rear-ultrasonic heading correction */
-  line_reset();
-  while (near < 2) {
-    int32_t g1 = b1 - m1->pulse_count, g3 = b3 - m3->pulse_count;  /* pulses gone backward */
-    if (backstop > 0 && g1 + g3 >= backstop) break;
-
-    /* Keep the same angle to the back wall as at the start (same steering direction
-     * as squaring up). If a rear sensor is missing, keep the last correction. */
-    if (rear_ok(0) && rear_ok(1)) {
-      us_turn = ALIGN_SIGN * BACK_US_K * ((rear[0] - rear[1]) - square_diff);
-      if (us_turn > BACK_US_MAX) us_turn = BACK_US_MAX;
-      if (us_turn < -BACK_US_MAX) us_turn = -BACK_US_MAX;
-    }
-    line_drive(-BACK_SPEED, &PID_BACK, us_turn);
-
-    if (rear_poll()) {                       /* count only fresh readings */
-      bool ok2 = rear_ok(0), ok3 = rear_ok(1);
-      float dist = (ok2 && ok3) ? (rear[0] + rear[1]) / 2 : ok2 ? rear[0] : rear[1];
-      near = dist < BACK_STOP_MM ? near + 1 : 0;
-    }
-    key1_show("K1 BACK");
+  /* Turn around on the spot (J1 forward, J3 back): first until no IR sensor sees the
+   * line (it has left it), then until a middle sensor finds it again, which is the
+   * line behind it. No exact angle needed; the line following straightens it out. */
+  bool left_line = false;
+  t = HAL_GetTick();
+  while (HAL_GetTick() - t < TURN_MAX_MS) {
+    IR_Update(&ir);
+    bool any = ir.black[IR_LEFTMOST] || ir.black[IR_LEFT_MIDDLE]
+            || ir.black[IR_RIGHT_MIDDLE] || ir.black[IR_RIGHTMOST];
+    bool middle = ir.black[IR_LEFT_MIDDLE] || ir.black[IR_RIGHT_MIDDLE];
+    if (!any) left_line = true;              /* step 1 done: off the line */
+    if (left_line && middle) break;          /* step 2 done: found it again */
+    ELCP_Motor_SetSpeed(MOTOR_J1, J1_GAIN * TURN_SPEED);
+    ELCP_Motor_SetSpeed(MOTOR_J3, J3_GAIN * -TURN_SPEED);
+    key1_show(left_line ? "K1 TURN FIND" : "K1 TURN LEAVE");
   }
   ELCP_Motor_Stop(MOTOR_J1);
   ELCP_Motor_Stop(MOTOR_J3);
+  HAL_Delay(200);
+
+  drive_to_wall("K1 RETURN");
 }
 
 /* USER CODE END 0 */
