@@ -4,19 +4,19 @@
 #include "main.h"
 #include <stdint.h>
 
-/* Three HC-SR04 style sensors. Each has a plain GPIO trigger and its echo on
- * channel 2 input capture (direct TI) of its own timer, with that timer's interrupt:
- *   index 0  US1  TRIG PA0  ECHO PA1  TIM2_CH2   (front)
- *   index 1  US2  TRIG PB6  ECHO PB7  TIM4_CH2
- *   index 2  US3  TRIG PB4  ECHO PB5  TIM3_CH2
+/* Three HC-SR04 style sensors. Each has a plain GPIO trigger and its echo on an
+ * input-capture channel (direct TI) with that timer's interrupt (pins from the .ioc):
+ *   index 0  US   TRIG PA0   ECHO PA1   TIM2_CH2   (front, used by key 1)
+ *   index 1  US1  TRIG PB8   ECHO PB9   TIM4_CH4
+ *   index 2  US2  TRIG PB11  ECHO PB10  TIM2_CH3
  *
  * The echo pulse width is timestamped by timer hardware, so other interrupts
  * (e.g. the ELCP motor FB EXTIs) delaying the ISR do not affect accuracy. */
 #define ULTRASONIC_COUNT 3
 
-/* Configures TIM2/TIM3/TIM4 for 1 us ticks (from the real APB1 timer clock) and
- * starts channel 2 input capture with interrupt on each.
- * Call once after MX_TIM2_Init, MX_TIM3_Init and MX_TIM4_Init. */
+/* Configures TIM2/TIM4 for 1 us ticks (from the real APB1 timer clock) and starts
+ * input capture with interrupt on each sensor's channel.
+ * Call once after MX_TIM2_Init and MX_TIM4_Init. */
 HAL_StatusTypeDef Ultrasonic_Start(void);
 
 /* Non-blocking, for sensor i (0..2). Returns the distance in mm from that

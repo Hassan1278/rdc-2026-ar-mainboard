@@ -50,6 +50,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/ir_sensor.c
     Core/Src/ultrasonic.c
     Core/Src/elcp_motor/elcp_motor.c
+    Core/Src/tof.c
     # Add user sources here
 )
 
