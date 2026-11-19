@@ -167,6 +167,7 @@ static void key1_show(const char *phase) {
 #define PIVOT_PULSES_PER_DEG 1.0f /* encoder pulses per degree of turning on the spot: CALIBRATE */
 #define PULL_SPEED  15.0f  /* % speed for the small pullback before turning */
 #define PULL_MS     1000   /* how long to pull back before turning */
+#define K1_HOOK_LEFT_PULSES 8 /* small BTN2 left adjustment: 2/10 of 114 encoder pulses */
 #define K2_HOOK_LEFT_PULSES 23 /* small BTN2 left adjustment: 2/10 of 114 encoder pulses */
 
 /* Key 2 */
@@ -454,6 +455,7 @@ static void key_motion(int k) {
   uint32_t t = HAL_GetTick();
   while (HAL_GetTick() - t < TURN_PAUSE_MS) key1_show(ph(k, "PAUSE"));
   pulses_shown = 0;
+  if (k == 1) pivot_pulses(K1_HOOK_LEFT_PULSES, 1.0f, PIVOT_SPEED, ph(k, "LEFT"));
   if (k == 2) pivot_pulses(K2_HOOK_LEFT_PULSES, 1.0f, PIVOT_SPEED, ph(k, "LEFT"));
   pivot_deg(-RIGHT_DEG, ph(k, "RIGHT"));
   t = HAL_GetTick();
