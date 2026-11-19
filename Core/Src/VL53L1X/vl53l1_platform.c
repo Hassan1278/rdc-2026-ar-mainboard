@@ -11,7 +11,7 @@ void VL53L1_PlatformDelay(uint32_t ms) { HAL_Delay(ms); }
 static int8_t write_bytes(uint16_t dev, uint16_t reg, uint8_t *data, uint16_t n)
 {
     if (first_error) return first_error;
-    HAL_StatusTypeDef status = HAL_I2C_Mem_Write(&hi2c2, dev, reg, I2C_MEMADD_SIZE_16BIT,
+    HAL_StatusTypeDef status = HAL_I2C_Mem_Write(&hi2c1, dev, reg, I2C_MEMADD_SIZE_16BIT,
                                                  data, n, VL53L1_I2C_TIMEOUT_MS);
     if (status != HAL_OK) first_error=-1;
     return first_error;
@@ -20,7 +20,7 @@ static int8_t read_bytes(uint16_t dev, uint16_t reg, uint8_t *data, uint16_t n)
 {
     for (uint16_t i=0;i<n;++i) data[i]=0;
     if (first_error) return first_error;
-    HAL_StatusTypeDef status = HAL_I2C_Mem_Read(&hi2c2, dev, reg, I2C_MEMADD_SIZE_16BIT,
+    HAL_StatusTypeDef status = HAL_I2C_Mem_Read(&hi2c1, dev, reg, I2C_MEMADD_SIZE_16BIT,
                                                 data, n, VL53L1_I2C_TIMEOUT_MS);
     if (status != HAL_OK) first_error=-1;
     return first_error;

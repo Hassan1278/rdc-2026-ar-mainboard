@@ -25,7 +25,7 @@ bool AR_ToFInit(AR_ToF *s,uint16_t address) {
     }
     uint16_t id=0;
     if (VL53L1X_GetSensorId(address,&id) || id!=0xeacc ||
-        VL53L1X_SensorInit(address) || VL53L1X_SetTimingBudgetInMs(address,50) ||
+        VL53L1X_SensorInit(address) || VL53L1X_SetTimingBudgetInMs(address,100) ||
         VL53L1X_SetDistanceMode(address,2) ||
         VL53L1X_SetInterMeasurementInMs(address,100) ||
         VL53L1X_StartRanging(address)) return false;
@@ -72,8 +72,8 @@ const char *AR_ToFBoardStatus(void) {
         if (!sensors[i].initialized) return fault[i];
     return "TOF READY";
 }
-/* HAL_I2C_Init software-resets I2C2, which also clears a latched BUSY state. */
-static bool bus_init(void) { return HAL_I2C_Init(&hi2c2)==HAL_OK; }
+/* HAL_I2C_Init software-resets I2C1, which also clears a latched BUSY state. */
+static bool bus_init(void) { return HAL_I2C_Init(&hi2c1)==HAL_OK; }
 
 /* Power-cycles sensor i through XSHUT so it boots at 0x52 whatever state it was in,
  * then initializes it and moves it to its own address. A sensor that is not running
@@ -89,7 +89,7 @@ static bool bring_up(unsigned i) {
     HAL_GPIO_WritePin(GPIOB,xshut[i],GPIO_PIN_SET);
     HAL_Delay(5);
     fault[i]=first?"T1 NO ACK":"T2 NO ACK";
-    if (HAL_I2C_IsDeviceReady(&hi2c2,0x52,3,10)!=HAL_OK) goto off;
+    if (HAL_I2C_IsDeviceReady(&hi2c1,0x52,3,10)!=HAL_OK) goto off;
     fault[i]=first?"T1 INIT FAIL":"T2 INIT FAIL";
     if (!AR_ToFInit(&sensors[i],0x52)) goto off;
     /* VL53L1X I2C_SLAVE__DEVICE_ADDRESS: register takes the 7-bit address. */
@@ -107,7 +107,7 @@ off:
     return false;
 }
 
-/* Call after MX_GPIO_Init and MX_I2C2_Init. */
+/* Call after MX_GPIO_Init and MX_I2C1_Init. */
 bool AR_ToFBoardInit(void) {
     last_poll = 0;
     for (unsigned i=0;i<2;i++) {
@@ -119,8 +119,8 @@ bool AR_ToFBoardInit(void) {
     HAL_Delay(5);
     /* Add internal pull-ups on SCL/SDA in case the modules have none. */
     GPIO_InitTypeDef g={0};
-    g.Pin=AR_TOF_SCL_Pin|AR_TOF_SDA_Pin; g.Mode=GPIO_MODE_AF_OD;
-    g.Pull=GPIO_PULLUP; g.Speed=GPIO_SPEED_FREQ_VERY_HIGH; g.Alternate=GPIO_AF4_I2C2;
+    g.Pin=GPIO_PIN_6|GPIO_PIN_7; /* PB6 I2C1_SCL, PB7 I2C1_SDA */ g.Mode=GPIO_MODE_AF_OD;
+    g.Pull=GPIO_PULLUP; g.Speed=GPIO_SPEED_FREQ_VERY_HIGH; g.Alternate=GPIO_AF4_I2C1;
     HAL_GPIO_Init(GPIOB,&g);
     /* A sensor that fails here stays in shutdown and is retried from AR_ToFBoardPoll. */
     bool ready=true;
@@ -172,8 +172,9 @@ bool AR_ToFBoardSample(unsigned index, AR_ToF *sample) {
 
 /* ======================= Analog IR line sensors ======================= */
 static const struct { ADC_HandleTypeDef *adc; uint32_t channel; } ir_channels[IR_COUNT]={
-    {&hadc3,ADC_CHANNEL_2},  /* PA2 Lefrtmost_IR   */
-    {&hadc1,ADC_CHANNEL_3},  /* PA3 Leftmiddle_IR  */
+    /* PA2/PA3 are swapped on the robot: PA3 is the leftmost sensor, PA2 left-middle. */
+    {&hadc1,ADC_CHANNEL_3},  /* PA3 leftmost     */
+    {&hadc3,ADC_CHANNEL_2},  /* PA2 left-middle  */
     {&hadc1,ADC_CHANNEL_13}, /* PC3 Middleright_IR */
     {&hadc2,ADC_CHANNEL_12}, /* PC2 Rightmost_IR   */
 };

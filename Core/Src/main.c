@@ -29,6 +29,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "lcd/lcd.h"
+#include "elcp_motor/elcp_motor.h"
 #include "ir_sensor.h"
 #include "ultrasonic.h"
 #include <stdio.h>
@@ -75,6 +76,55 @@ static void boot_log(const char *msg) {
   tft_update(0);
 }
 
+/* ---- Key 1: follow the line forward to the ultrasonic target, then back to the start ---- */
+#define BASE_SPEED  25.0f  /* % before gearing; J1 gets 2x this */
+#define J1_GAIN     2.0f   /* J1 needs ~2x J3 to drive straight */
+#define J3_GAIN     1.0f
+#define LINE_K      -10.0f /* steering strength; negative = J1 is the right wheel. Flip if it steers away */
+#define US_STOP_MM  150    /* forward stops this close to the target */
+#define BACK_SPEED  15.0f  /* slower on the way back */
+#define BACK_LINE_K 4.0f   /* reversing needs the opposite sign to LINE_K, and gentler steering */
+
+static float line_err;     /* -2 = line far left .. +2 = line far right; kept if the line is lost */
+
+/* One pass: base speed (+ forward, - backward) plus steering by k toward the line. */
+static void line_drive(float base, float k) {
+  IR_Update(&ir);
+  int n = ir.black[IR_LEFTMOST] + ir.black[IR_LEFT_MIDDLE]
+        + ir.black[IR_RIGHT_MIDDLE] + ir.black[IR_RIGHTMOST];
+  if (n) line_err = (-2.0f * ir.black[IR_LEFTMOST] - ir.black[IR_LEFT_MIDDLE]
+                     + ir.black[IR_RIGHT_MIDDLE] + 2.0f * ir.black[IR_RIGHTMOST]) / n;
+  float turn = k * line_err;
+  ELCP_Motor_SetSpeed(MOTOR_J1, J1_GAIN * (base + turn));
+  ELCP_Motor_SetSpeed(MOTOR_J3, J3_GAIN * (base - turn));
+}
+
+static void key1(void) {
+  line_err = 0;
+  HAL_Delay(1000);  /* 1 s after the press before moving */
+
+  /* Encoder total at the start; counts go up forward and down backward. */
+  const ELCP_Motor_State_t *m1 = ELCP_Motor_GetState(MOTOR_J1);
+  const ELCP_Motor_State_t *m3 = ELCP_Motor_GetState(MOTOR_J3);
+  int32_t start = m1->pulse_count + m3->pulse_count;
+
+  /* Forward until 2 ultrasonic readings in a row are closer than US_STOP_MM. */
+  int close = 0;
+  uint32_t last_us = 0;
+  while (close < 2) {
+    line_drive(BASE_SPEED, LINE_K);
+    if (HAL_GetTick() - last_us >= 60) {
+      last_us = HAL_GetTick();
+      int32_t d = Ultrasonic_ReadMm();
+      close = (d >= 0 && d < US_STOP_MM) ? close + 1 : 0;
+    }
+  }
+  /* Straight into reverse, following the line, until the encoders are back at the start. */
+  while (m1->pulse_count + m3->pulse_count > start)
+    line_drive(-BACK_SPEED, BACK_LINE_K);
+  ELCP_Motor_Stop(MOTOR_J1);
+  ELCP_Motor_Stop(MOTOR_J3);
+}
 
 /* USER CODE END 0 */
 
@@ -112,12 +162,18 @@ int main(void)
   MX_USART1_UART_Init();
   MX_TIM8_Init();
   MX_TIM12_Init();
-  MX_I2C2_Init();
   MX_ADC1_Init();
   MX_ADC2_Init();
   MX_ADC3_Init();
+  MX_I2C1_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
-  /* PWM timers are configured but NEVER started in this sensor-only demo. */
+  /* Starts TIM12 CH1 / TIM8 CH2 PWM with both motors stopped (0 % duty). */
+  ELCP_Motor_Init(MOTOR_J1);
+  ELCP_Motor_Init(MOTOR_J3);
+  ELCP_Motor_Stop(MOTOR_J1);
+  ELCP_Motor_Stop(MOTOR_J3);
+
   tft_init(PIN_ON_TOP, BLACK, WHITE, CYAN, DARK_GREY);
   boot_log("SENSOR STARTUP");
   boot_log("TFT OK");
@@ -152,19 +208,52 @@ int main(void)
       last_us = HAL_GetTick();
       us_mm = Ultrasonic_ReadMm();
     }
+    if (btn_read(BTN1)) key1();
+    if (btn_read(BTN2)) {
+      ELCP_Motor_SetSpeed(MOTOR_J1, 50.0f);    /* forward */
+      ELCP_Motor_SetSpeed(MOTOR_J3, 25.0f);
+      HAL_Delay(5000);
+      ELCP_Motor_Stop(MOTOR_J1);               /* stop */
+      ELCP_Motor_Stop(MOTOR_J3);
+      HAL_Delay(1000);
+      ELCP_Motor_SetSpeed(MOTOR_J1, -50.0f);   /* backward */
+      ELCP_Motor_SetSpeed(MOTOR_J3, -25.0f);
+      HAL_Delay(5000);
+      ELCP_Motor_Stop(MOTOR_J1);
+      ELCP_Motor_Stop(MOTOR_J3);
+    }
 
-    /* Fill the screen buffer (tft_update clears it after each refresh) */
+    ELCP_Motor_UpdatePPS(MOTOR_J1);          /* refreshes pps/rpm once per second */
+    ELCP_Motor_UpdatePPS(MOTOR_J3);
+
+    /* Fill the screen buffer (tft_update clears it after each refresh).
+     * ST7735 pin-on-top: 16 columns x 10 rows. */
     tft_prints(0, 0, "IR  RAW TRIG B");
     for (unsigned i = 0; i < IR_COUNT; i++) {
       char state = !ir.ok[i] ? '?' : ir.black[i] ? '#' : '.';
       tft_prints(0, 1 + i, "%s %4d %4d %c", ir_names[i],
                  (int)ir.raw[i], (int)ir.trigger[i], state);
     }
-    tft_prints(0, 5, "US %d mm", (int)us_mm);
-    tft_prints(0, 6, "T1 %d mm", (int)AR_ToFBoardDistanceAt(0));
-    tft_prints(0, 7, "T2 %d mm", (int)AR_ToFBoardDistanceAt(1));
-    tft_prints(0, 8, "%s", AR_ToFBoardStatus());
-    tft_prints(0, 9, "%s", us_mm < 0 ? "US NO ECHO" : "US OK");
+
+    /* Row 5: ultrasonic (front), result of the previous 60 ms ping */
+    if (us_mm < 0) tft_prints(0, 5, "US  NO ECHO");
+    else           tft_prints(0, 5, "US  %4d mm", (int)us_mm);
+
+    /* Row 6: rear ToFs, "----" = no reading */
+    int32_t t1 = AR_ToFBoardDistanceAt(0), t2 = AR_ToFBoardDistanceAt(1);
+    char t1s[12] = "----", t2s[12] = "----";
+    if (t1 >= 0) snprintf(t1s, sizeof t1s, "%4d", (int)t1);
+    if (t2 >= 0) snprintf(t2s, sizeof t2s, "%4d", (int)t2);
+    tft_prints(0, 6, "T1 %s T2 %s", t1s, t2s);
+
+    /* Row 7: ToF board status (TOF READY or the fault) */
+    tft_prints(0, 7, "%s", AR_ToFBoardStatus());
+
+    /* Rows 8-9: motors, commanded % and measured rpm */
+    const ELCP_Motor_State_t *m1 = ELCP_Motor_GetState(MOTOR_J1);
+    const ELCP_Motor_State_t *m3 = ELCP_Motor_GetState(MOTOR_J3);
+    tft_prints(0, 8, "J1%+5d%%%+5drpm", (int)m1->current_speed_pct, (int)m1->rpm);
+    tft_prints(0, 9, "J3%+5d%%%+5drpm", (int)m3->current_speed_pct, (int)m3->rpm);
 
     /* Push to the TFT every 50 ms */
     tft_update(50);

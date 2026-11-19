@@ -91,10 +91,6 @@ void Error_Handler(void);
 #define TFT_BL_GPIO_Port GPIOB
 #define BTN1_Pin GPIO_PIN_1
 #define BTN1_GPIO_Port GPIOB
-#define AR_TOF_SCL_Pin GPIO_PIN_10
-#define AR_TOF_SCL_GPIO_Port GPIOB
-#define AR_TOF_SDA_Pin GPIO_PIN_11
-#define AR_TOF_SDA_GPIO_Port GPIOB
 #define ELCP_J1_PWM_Pin GPIO_PIN_14
 #define ELCP_J1_PWM_GPIO_Port GPIOB
 #define ELCP_J1_FB_Pin GPIO_PIN_15
@@ -109,10 +105,10 @@ void Error_Handler(void);
 #define ELCP_J3_FB_EXTI_IRQn EXTI9_5_IRQn
 #define ELCP_J3_DIR_Pin GPIO_PIN_9
 #define ELCP_J3_DIR_GPIO_Port GPIOC
-#define AR_TOF_1_XSHUT_Pin GPIO_PIN_6
-#define AR_TOF_1_XSHUT_GPIO_Port GPIOB
-#define AR_TOF_2_XSHUT_Pin GPIO_PIN_7
+#define AR_TOF_2_XSHUT_Pin GPIO_PIN_4
 #define AR_TOF_2_XSHUT_GPIO_Port GPIOB
+#define AR_TOF_1_XSHUT_Pin GPIO_PIN_5
+#define AR_TOF_1_XSHUT_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 #define __forceinline __attribute__((__always_inline__)) inline

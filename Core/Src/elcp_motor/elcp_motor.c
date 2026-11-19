@@ -45,7 +45,7 @@ static ELCP_Motor_t motor_J3 = {
     .dir_pin = ELCP_J3_DIR_Pin,      // DIR PC9 (white)
     .fb_pin = ELCP_J3_FB_Pin,        // FB  PC8 (yellow)
     .fb_port = ELCP_J3_FB_GPIO_Port,
-    .invert_dir = false,
+    .invert_dir = true,
     .invert_pwm = false,
     .pulses_per_rev = ELCP_FB_PULSES_PER_REV
 };
