@@ -167,6 +167,7 @@ static void key1_show(const char *phase) {
 #define PIVOT_PULSES_PER_DEG 1.0f /* encoder pulses per degree of turning on the spot: CALIBRATE */
 #define PULL_SPEED  15.0f  /* % speed for the small pullback before turning */
 #define PULL_MS     1000   /* how long to pull back before turning */
+#define K2_HOOK_LEFT_PULSES 23 /* small BTN2 left adjustment: 2/10 of 114 encoder pulses */
 
 /* Key 2 */
 #define K2_BRANCH_N 2      /* turn right at this branch on the right (2nd = the D's line) */
@@ -261,6 +262,26 @@ static void pivot_deg(float deg, const char *phase) {
     if (turned >= target) break;
     ELCP_Motor_SetSpeed(MOTOR_J1, J1_GAIN * dir * PIVOT_SPEED);
     ELCP_Motor_SetSpeed(MOTOR_J3, J3_GAIN * -dir * PIVOT_SPEED);
+    key1_show(phase);
+  }
+  ELCP_Motor_Stop(MOTOR_J1);
+  ELCP_Motor_Stop(MOTOR_J3);
+  HAL_Delay(200);
+}
+
+/* Turn left or right by an exact number of encoder pulses before continuing. */
+static void pivot_pulses(int32_t pulses, float dir, float speed, const char *phase) {
+  const ELCP_Motor_State_t *m1 = ELCP_Motor_GetState(MOTOR_J1);
+  const ELCP_Motor_State_t *m3 = ELCP_Motor_GetState(MOTOR_J3);
+  int32_t p1 = m1->pulse_count, p3 = m3->pulse_count;
+  int32_t turned = 0;
+  uint32_t t = HAL_GetTick();
+  while (HAL_GetTick() - t < 3000) {
+    turned = (int32_t)dir * ((m1->pulse_count - p1) - (m3->pulse_count - p3));
+    if (turned >= pulses) break;
+    ELCP_Motor_SetSpeed(MOTOR_J1, J1_GAIN * dir * speed);
+    ELCP_Motor_SetSpeed(MOTOR_J3, J3_GAIN * -dir * speed);
+    pulses_shown = turned;
     key1_show(phase);
   }
   ELCP_Motor_Stop(MOTOR_J1);
@@ -433,6 +454,7 @@ static void key_motion(int k) {
   uint32_t t = HAL_GetTick();
   while (HAL_GetTick() - t < TURN_PAUSE_MS) key1_show(ph(k, "PAUSE"));
   pulses_shown = 0;
+  if (k == 2) pivot_pulses(K2_HOOK_LEFT_PULSES, 1.0f, PIVOT_SPEED, ph(k, "LEFT"));
   pivot_deg(-RIGHT_DEG, ph(k, "RIGHT"));
   t = HAL_GetTick();
   while (HAL_GetTick() - t < PULL_MS) {
