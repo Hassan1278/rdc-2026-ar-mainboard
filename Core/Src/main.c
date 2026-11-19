@@ -122,14 +122,14 @@ static void key1_show(const char *phase) {
 /* ---- Key 1 -------------------------------------------------------------------------
  * 1. START    1 s still.
  * 2. TO KEY   line PID at BASE_SPEED, APPROACH_SPEED inside APPROACH_MM;
- *             stop when US1 (front) < KEY_STOP_MM (160 mm) twice in a row. Straight line, so
+ *             stop when US1 (front) < KEY1_STOP_MM (165 mm) twice in a row. Straight line, so
  *             steering is capped at LINE_TURN_RATIO of the speed (no junctions).
  * 3. PAUSE    1 s still.
  * 4. KEY OFF  turn right RIGHT_DEG (60 deg), then pull back a little.
  * 5. TURN     right on the spot; a line seen inside TURN_WIN_MIN..TURN_WIN_MAX pulses
  *             is the straight path back: stop and follow it. Lines outside are ignored.
  * 6. RETURN   same line PID and steering cap as step 2, until all 4 IR see black (T-line),
- *             then straight ahead 2:1 into the start zone, stop at GOAL_STOP_MM (90 mm).
+ *             then straight ahead 2:1 into the start zone, stop at GOAL_STOP_MM (110 mm).
  * Line reading: middle sensors first, outer only if both middle are off,
  * 3+ black (junction) = straight, line lost = keep steering toward the last side.
  * ------------------------------------------------------------------------------------ */
@@ -140,8 +140,9 @@ static void key1_show(const char *phase) {
 #define LINE_KD     -6.0f  /* damping: brakes the turn as the line comes back to centre. Same sign as LINE_KP */
 #define LINE_DT_MS  5      /* steering update period, ms: small steps, often */
 #define LINE_SLEW   1.0f   /* max steering change per update, % (5 ms -> 0 to full turn in 100 ms) */
-#define KEY_STOP_MM 160    /* forward leg: key detected, stop this far from the key holder */
-#define GOAL_STOP_MM 90    /* return leg: after the T, drive straight 2:1 and stop this
+#define KEY1_STOP_MM 165   /* key 1: stop this far from the key holder */
+#define KEY2_STOP_MM 155   /* key 2: stop this far from the key holder */
+#define GOAL_STOP_MM 110   /* return leg: after the T, drive straight 2:1 and stop this
                             * far from the wall of the start zone (front ultrasonic) */
 #define GOAL_MAX_MS 8000   /* safety: stop the straight drive after this if US1 never trips */
 #define GOAL_IGNORE_MS 500 /* return leg: ignore a T this soon after starting */
@@ -167,11 +168,27 @@ static void key1_show(const char *phase) {
 #define PULL_SPEED  15.0f  /* % speed for the small pullback before turning */
 #define PULL_MS     1000   /* how long to pull back before turning */
 
+/* Key 2 */
+#define K2_BRANCH_N 2      /* turn right at this branch on the right (2nd = the D's line) */
+#define BRANCH_LOCKOUT_MS 300 /* a branch counts once: next one only after this long
+                               * without branch readings */
+#define BRANCH_IGNORE_MS 500  /* ignore branches this soon after the start (start zone) */
+#define BRANCH_MAX_MS 30000   /* safety: give up counting after this */
+#define AXLE_FWD_PULSES 80 /* IR bar -> wheel axle, in J3 encoder pulses: drive this far
+                            * past the junction before pivoting. CALIBRATE */
+#define AXLE_FWD_MAX_MS 3000  /* safety for that move */
+#define TURN90_WIN_MIN 100 /* 90 deg pivots at the junctions: the new line is the only one */
+#define TURN90_WIN_MAX 320 /* in this window of pulses. CALIBRATE from the end screen */
+#define K2_TURN_WIN_MIN 330 /* turn-around at the key 2 holder: the R's diagonal comes ~45 deg */
+#define K2_TURN_WIN_MAX 480 /* before the vertical line, so MIN must be above the diagonal's
+                             * count. CALIBRATE from the end screen's TURN line */
+
 static float line_err;     /* -2 = line far left .. +2 = line far right; kept if the line is lost */
 static float line_hist[4]; /* last 4 errors, so D measures the change over 20 ms */
 static unsigned line_hi;
 static float line_turn;
 static uint32_t line_ms;
+static bool line_keep_right; /* right-edge mode: at a split, take the right-hand line */
 
 /* Fresh steering state, before each drive. */
 static void line_reset(void) {
@@ -179,15 +196,28 @@ static void line_reset(void) {
   line_hist[0] = line_hist[1] = line_hist[2] = line_hist[3] = 0;
   line_hi = 0;
   line_ms = 0;
+  line_keep_right = false;
 }
 
 /* Reads the IR and updates line_err. Middle sensors first: the outer ones only count
  * when the line has left both middle ones, so a junction branch touching LL/RR can't
- * steer it. 3+ black (junction) reads as straight. Nothing seen: keep the last value. */
+ * steer it. 3+ black (junction) reads as straight. Nothing seen: keep the last value.
+ * Right-edge mode instead keeps the line's right edge between RM and RR (line under RM,
+ * RR white), judged from the right side first: a second line on the left (a branch
+ * splitting off left) is ignored while RM/RR still see the right one. */
 static void line_read(void) {
   IR_Update(&ir);
   bool ll = ir.black[IR_LEFTMOST], lm = ir.black[IR_LEFT_MIDDLE];
   bool rm = ir.black[IR_RIGHT_MIDDLE], rr = ir.black[IR_RIGHTMOST];
+  if (line_keep_right) {
+    if (ll && lm && rm && rr) line_err = 0.0f;  /* T / crossing: straight */
+    else if (rr && rm)  line_err = 1.0f;        /* edge drifted right: move right */
+    else if (rr)        line_err = 2.0f;        /* far right */
+    else if (rm)        line_err = 0.0f;        /* on target */
+    else if (lm)        line_err = -1.0f;       /* line only left of centre: move left */
+    else if (ll)        line_err = -2.0f;       /* far left */
+    return;                                     /* nothing seen: keep the last value */
+  }
   if ((int)ll + (int)lm + (int)rm + (int)rr >= 3) line_err = 0.0f;  /* junction: straight */
   else if (lm || rm)  line_err = (float)rm - (float)lm;  /* -1, 0 (centred) or +1 */
   else if (ll && !rr) line_err = -2.0f;                  /* slipped far left */
@@ -238,12 +268,26 @@ static void pivot_deg(float deg, const char *phase) {
   HAL_Delay(200);
 }
 
-/* Forward leg: follow the straight line to the key holder. Slow down inside
- * APPROACH_MM, stop when the front ultrasonic US1 reads under KEY_STOP_MM twice in a
- * row. Steering is capped at LINE_TURN_RATIO of the speed, so a junction branch can't
- * pull it off the straight. */
-static void drive_to_wall(const char *phase) {
+/* "K<k> <what>" for the screen title. One shared buffer: use the result right away. */
+static const char *ph(int k, const char *what) {
+  static char b[17];
+  snprintf(b, sizeof b, "K%d %s", k, what);
+  return b;
+}
+
+/* Seeds the line follower with the side the line is on (-1 left, 0 ahead, +1 right),
+ * used until a sensor sees the line. Same history, so no D kick at the start. */
+static void line_start(float start_err) {
   line_reset();
+  line_err = start_err;
+  for (unsigned i = 0; i < 4; i++) line_hist[i] = start_err;
+}
+
+/* Follow the line to the wall ahead (key holder). Slow down inside APPROACH_MM, stop
+ * when the front ultrasonic US1 reads under stop_mm twice in a row. Steering is capped
+ * at LINE_TURN_RATIO of the speed, so a junction branch can't pull it off the straight. */
+static void drive_to_wall(const char *phase, float start_err, int32_t stop_mm) {
+  line_start(start_err);
   int close = 0;
   uint32_t last_us = 0;
   float speed = BASE_SPEED;
@@ -253,7 +297,7 @@ static void drive_to_wall(const char *phase) {
       last_us = HAL_GetTick();
       int32_t d = Ultrasonic_ReadMm(0);   /* US1, front */
       us_mm[0] = d;
-      close = (d >= 0 && d < KEY_STOP_MM) ? close + 1 : 0;
+      close = (d >= 0 && d < stop_mm) ? close + 1 : 0;
       if (d >= 0 && d < APPROACH_MM) speed = APPROACH_SPEED;  /* slow final approach, stays slow */
     }
     key1_show(phase);
@@ -262,31 +306,28 @@ static void drive_to_wall(const char *phase) {
   ELCP_Motor_Stop(MOTOR_J3);
 }
 
-/* Return leg: follow the line (same steering cap as the forward leg) until all 4 IR see black
- * on two fresh readings in a row: the T-line at the goal. Then drive straight ahead,
- * no steering (J1:J3 = 2:1 like any straight run), into the start zone: slow down
- * inside APPROACH_MM, stop when US1 reads under GOAL_STOP_MM twice in a row.
- * start_err: which side the line is on if no sensor sees it at the start
- * (-1 left, 0 straight ahead, +1 right); a sensor seeing the line overrides it. */
-static void drive_to_goal(const char *phase, float start_err) {
-  line_reset();
-  line_err = start_err;
-  for (unsigned i = 0; i < 4; i++) line_hist[i] = start_err;   /* no D kick at start */
+/* Follow the line (same capped steering) until all 4 IR see black on two fresh readings
+ * in a row: a T-line. A T in the first ignore_ms is ignored. Motors keep running. */
+static void follow_to_T(const char *phase, float start_err, uint32_t ignore_ms) {
+  line_start(start_err);
   uint32_t t0 = HAL_GetTick(), seen_read = 0;
   int t_hits = 0;
   while (HAL_GetTick() - t0 < RETURN_MAX_MS) {
-    line_drive(BASE_SPEED, LINE_TURN_RATIO * BASE_SPEED);   /* same as the forward leg */
+    line_drive(BASE_SPEED, LINE_TURN_RATIO * BASE_SPEED);
     if (line_ms != seen_read) {              /* a fresh IR reading (every LINE_DT_MS) */
       seen_read = line_ms;
       bool all = ir.black[IR_LEFTMOST] && ir.black[IR_LEFT_MIDDLE] &&
                  ir.black[IR_RIGHT_MIDDLE] && ir.black[IR_RIGHTMOST];
-      t_hits = (all && HAL_GetTick() - t0 >= GOAL_IGNORE_MS) ? t_hits + 1 : 0;
-      if (t_hits >= 2) break;                /* T-line: goal */
+      t_hits = (all && HAL_GetTick() - t0 >= ignore_ms) ? t_hits + 1 : 0;
+      if (t_hits >= 2) break;                /* T-line */
     }
     key1_show(phase);
   }
-  /* Past the T: straight ahead at the plain 2:1 ratio into the start zone, stopped by
-   * the front ultrasonic at GOAL_STOP_MM. GOAL_MAX_MS is a safety limit only. */
+}
+
+/* Straight ahead at the plain 2:1 ratio (no steering), slow inside APPROACH_MM, stop
+ * when US1 reads under stop_mm twice in a row. GOAL_MAX_MS is a safety limit only. */
+static void straight_to_wall(const char *phase, int32_t stop_mm) {
   uint32_t t = HAL_GetTick(), last_us = 0;
   int close = 0;
   float speed = BASE_SPEED;
@@ -297,106 +338,235 @@ static void drive_to_goal(const char *phase, float start_err) {
       last_us = HAL_GetTick();
       int32_t d = Ultrasonic_ReadMm(0);      /* US1, front */
       us_mm[0] = d;
-      close = (d >= 0 && d < GOAL_STOP_MM) ? close + 1 : 0;
+      close = (d >= 0 && d < stop_mm) ? close + 1 : 0;
       if (d >= 0 && d < APPROACH_MM) speed = APPROACH_SPEED;  /* slow final approach */
     }
-    key1_show("K1 GOAL");
+    key1_show(phase);
   }
   ELCP_Motor_Stop(MOTOR_J1);
   ELCP_Motor_Stop(MOTOR_J3);
 }
 
-static void key1(void) {
-  pulses_shown = -1;
-  uint32_t t = HAL_GetTick();                /* 1 s after the press before moving */
-  while (HAL_GetTick() - t < 1000) key1_show("K1 START");
+/* Return to the start: follow the line to the T-line at the start zone, then straight
+ * 2:1 into it and stop at GOAL_STOP_MM. */
+static void drive_to_goal(int k, float start_err) {
+  follow_to_T(ph(k, "RETURN"), start_err, GOAL_IGNORE_MS);
+  straight_to_wall(ph(k, "GOAL"), GOAL_STOP_MM);
+}
 
-  drive_to_wall("K1 TO KEY");
+/* Lines met during a pivot, for calibrating its window (shown after the run). */
+typedef struct {
+  int32_t at[TURN_LOG_MAX];  /* pulses turned at each line met (middle white -> black) */
+  unsigned n;                /* lines met (can exceed TURN_LOG_MAX) */
+  int32_t stop;              /* pulses turned when the turn stopped */
+} TurnLog;
 
-  t = HAL_GetTick();                         /* stand still at the key */
-  while (HAL_GetTick() - t < TURN_PAUSE_MS) key1_show("K1 PAUSE");
-
-  /* Turn right RIGHT_DEG degrees at the key. */
-  pulses_shown = 0;
-  pivot_deg(-RIGHT_DEG, "K1 RIGHT");
-
-  /* Small pullback before turning around. */
-  t = HAL_GetTick();
-  while (HAL_GetTick() - t < PULL_MS) {
-    ELCP_Motor_SetSpeed(MOTOR_J1, J1_GAIN * -PULL_SPEED);
-    ELCP_Motor_SetSpeed(MOTOR_J3, J3_GAIN * -PULL_SPEED);
-    key1_show("K1 PULL");
-  }
-  ELCP_Motor_Stop(MOTOR_J1);
-  ELCP_Motor_Stop(MOTOR_J3);
-  HAL_Delay(200);
-
-  /* Turn around RIGHT on the spot (J1 back, J3 forward). The straight path back is the
-   * only line inside the window TURN_WIN_MIN..TURN_WIN_MAX encoder pulses of turning:
-   * lines outside it (the junction branch) are ignored. A middle sensor seeing black
-   * inside the window = the path: stop and follow it. The window is measured with the
-   * encoders, so battery level doesn't move it. Reaching TURN_WIN_MAX also stops the
-   * turn, so it never swings on to another line.
-   * Every line met (a middle sensor going white -> black) is logged with its pulse
-   * count and shown after the run, to set the window. */
+/* Pivot on the spot (dir +1 = left, -1 = right) until a middle sensor sees a line inside
+ * the window win_min..win_max encoder pulses of turning. Lines outside the window are
+ * ignored and reaching win_max ends the turn, so it never swings on to another line.
+ * need_leave: the sensors start on a line (at a junction), so it must be left first.
+ * The robot coasts a little after stopping: if the line slipped past the middle
+ * sensors it turns back slowly until one sees it again.
+ * Returns the side the line is on if no sensor sees it (start_err for the next follow). */
+static float pivot_to_line(float dir, int32_t win_min, int32_t win_max, bool need_leave,
+                           TurnLog *log, const char *phase) {
   const ELCP_Motor_State_t *m1 = ELCP_Motor_GetState(MOTOR_J1);
   const ELCP_Motor_State_t *m3 = ELCP_Motor_GetState(MOTOR_J3);
   int32_t p1 = m1->pulse_count, p3 = m3->pulse_count;
-  int32_t turned = 0, lines_at[TURN_LOG_MAX];
-  unsigned lines = 0;
-  bool was_middle = true;                    /* starts near the line: no edge yet */
-  t = HAL_GetTick();
-  while (HAL_GetTick() - t < TURN_MAX_MS && turned < TURN_WIN_MAX) {
+  int32_t turned = 0;
+  bool was_middle = true;                    /* starts near a line: no edge yet */
+  bool left_line = !need_leave;
+  log->n = 0;
+  uint32_t t = HAL_GetTick();
+  while (HAL_GetTick() - t < TURN_MAX_MS && turned < win_max) {
     IR_Update(&ir);
     bool middle = ir.black[IR_LEFT_MIDDLE] || ir.black[IR_RIGHT_MIDDLE];
-    turned = (m3->pulse_count - p3) - (m1->pulse_count - p1);
+    turned = (int32_t)dir * ((m1->pulse_count - p1) - (m3->pulse_count - p3));
     if (middle && !was_middle) {             /* log every line met */
-      if (lines < TURN_LOG_MAX) lines_at[lines] = turned;
-      lines++;
+      if (log->n < TURN_LOG_MAX) log->at[log->n] = turned;
+      log->n++;
     }
     was_middle = middle;
-    if (middle && turned >= TURN_WIN_MIN) break;   /* line inside the window: the path */
-    ELCP_Motor_SetSpeed(MOTOR_J1, J1_GAIN * -TURN_SPEED);
-    ELCP_Motor_SetSpeed(MOTOR_J3, J3_GAIN * TURN_SPEED);
+    if (!middle) left_line = true;
+    if (middle && left_line && turned >= win_min) break;   /* line inside the window */
+    ELCP_Motor_SetSpeed(MOTOR_J1, J1_GAIN * dir * TURN_SPEED);
+    ELCP_Motor_SetSpeed(MOTOR_J3, J3_GAIN * -dir * TURN_SPEED);
     pulses_shown = turned;                   /* stays on screen after */
-    key1_show(turned < TURN_WIN_MIN ? "K1 TURN SKIP" : "K1 TURN WINDOW");
+    key1_show(phase);
   }
   ELCP_Motor_Stop(MOTOR_J1);
   ELCP_Motor_Stop(MOTOR_J3);
   HAL_Delay(200);
+  log->stop = turned;
 
-  /* The robot coasts a little after stopping, so the line can slip past the middle
-   * sensors. Turning right moves the line to the robot's left, so turn back LEFT
-   * (J1 forward, J3 back) until a middle sensor sees it again. */
-  float return_side = -1.0f;                 /* overshot a right turn: line on the left */
+  /* Turning moves the line the other way across the robot, so after coasting past it
+   * the line is on the side we turned from: turn back that way, slowly. */
+  float side = dir;                          /* right turn overshot: line on the left */
   IR_Update(&ir);
-  if (turned >= TURN_WIN_MIN && turned < TURN_WIN_MAX &&
+  if (turned >= win_min && turned < win_max &&
       !ir.black[IR_LEFT_MIDDLE] && !ir.black[IR_RIGHT_MIDDLE]) {
     t = HAL_GetTick();
     while (HAL_GetTick() - t < SETTLE_MAX_MS) {
       IR_Update(&ir);
       if (ir.black[IR_LEFT_MIDDLE] || ir.black[IR_RIGHT_MIDDLE]) break;
-      ELCP_Motor_SetSpeed(MOTOR_J1, J1_GAIN * SETTLE_SPEED);
-      ELCP_Motor_SetSpeed(MOTOR_J3, J3_GAIN * -SETTLE_SPEED);
-      key1_show("K1 TURN BACK");
+      ELCP_Motor_SetSpeed(MOTOR_J1, J1_GAIN * -dir * SETTLE_SPEED);
+      ELCP_Motor_SetSpeed(MOTOR_J3, J3_GAIN * dir * SETTLE_SPEED);
+      key1_show("TURN BACK");
     }
     ELCP_Motor_Stop(MOTOR_J1);
     ELCP_Motor_Stop(MOTOR_J3);
     HAL_Delay(200);
-    return_side = 1.0f;                      /* if it coasted again, now to the right */
+    side = -dir;                             /* if it coasted again, now the other side */
   }
+  return side;
+}
 
-  drive_to_goal("K1 RETURN", return_side);
+/* 1 s still after the button press. */
+static void key_start(int k) {
+  pulses_shown = -1;
+  uint32_t t = HAL_GetTick();
+  while (HAL_GetTick() - t < 1000) key1_show(ph(k, "START"));
+}
+
+/* At the key holder: stand still, turn right RIGHT_DEG, pull back a little. */
+static void key_motion(int k) {
+  uint32_t t = HAL_GetTick();
+  while (HAL_GetTick() - t < TURN_PAUSE_MS) key1_show(ph(k, "PAUSE"));
+  pulses_shown = 0;
+  pivot_deg(-RIGHT_DEG, ph(k, "RIGHT"));
+  t = HAL_GetTick();
+  while (HAL_GetTick() - t < PULL_MS) {
+    ELCP_Motor_SetSpeed(MOTOR_J1, J1_GAIN * -PULL_SPEED);
+    ELCP_Motor_SetSpeed(MOTOR_J3, J3_GAIN * -PULL_SPEED);
+    key1_show(ph(k, "PULL"));
+  }
+  ELCP_Motor_Stop(MOTOR_J1);
+  ELCP_Motor_Stop(MOTOR_J3);
+  HAL_Delay(200);
+}
+
+static void key1(void) {
+  key_start(1);
+  drive_to_wall("K1 TO KEY", 0.0f, KEY1_STOP_MM);
+  key_motion(1);
+  /* Turn around right: the straight path back is the only line inside the window. */
+  TurnLog turn;
+  float side = pivot_to_line(-1.0f, TURN_WIN_MIN, TURN_WIN_MAX, false, &turn, "K1 TURN");
+  drive_to_goal(1, side);
 
   /* After the run: where the turn met lines, to set the window around the straight
    * path's count (and away from the junction branch's). */
   tft_prints(0, 0, "TURN LINES AT");
-  unsigned shown = lines < TURN_LOG_MAX ? lines : TURN_LOG_MAX;
+  unsigned shown = turn.n < TURN_LOG_MAX ? turn.n : TURN_LOG_MAX;
   for (unsigned i = 0; i < shown; i++)
-    tft_prints(0, 1 + i, "LINE %u: %d", i + 1, (int)lines_at[i]);
-  if (lines == 0) tft_prints(0, 1, "NONE");
-  tft_prints(0, 8, "STOP AT %d", (int)turned);
+    tft_prints(0, 1 + i, "LINE %u: %d", i + 1, (int)turn.at[i]);
+  if (turn.n == 0) tft_prints(0, 1, "NONE");
+  tft_prints(0, 8, "STOP AT %d", (int)turn.stop);
   tft_prints(0, 9, "WIN %d-%d", (int)TURN_WIN_MIN, (int)TURN_WIN_MAX);
+  tft_update(0);
+  HAL_Delay(8000);
+}
+
+/* ---- Key 2 -------------------------------------------------------------------------
+ * Holder at the bottom of the D's vertical line. Route: east along the top line, right
+ * at the 2nd branch on the right, down to the holder, key motion, turn around, up to
+ * the top line (T), left, west to the start. Same follower, cap and stops as key 1.
+ * ------------------------------------------------------------------------------------ */
+
+/* Follow the line (capped steering) and count junctions, on two fresh readings in a row:
+ *   t_junction false: a branch leaving to the RIGHT = rightmost sensor black while a
+ *                     middle sensor is still on the line and the leftmost is not.
+ *   t_junction true:  a T = BOTH outer sensors black with a middle one (a line out to
+ *                     both sides; a branch on one side only, like the diagonal, never
+ *                     shows this).
+ * Each junction counts once; another can only be counted after BRANCH_LOCKOUT_MS without
+ * junction readings. Junctions in the first ignore_ms are ignored. keep_right: follow
+ * the line's right edge (a line splitting off left is ignored). Returns at junction n,
+ * motors running. */
+static void follow_to_junction(const char *title, unsigned n, bool t_junction,
+                               float start_err, bool keep_right, uint32_t ignore_ms) {
+  line_start(start_err);
+  line_keep_right = keep_right;
+  uint32_t t0 = HAL_GetTick(), seen_read = 0, last_branch = 0;
+  unsigned count = 0;
+  int hits = 0;
+  bool in_branch = false;
+  char shown[17];
+  while (count < n && HAL_GetTick() - t0 < BRANCH_MAX_MS) {
+    line_drive(BASE_SPEED, LINE_TURN_RATIO * BASE_SPEED);
+    if (line_ms != seen_read) {              /* a fresh IR reading */
+      seen_read = line_ms;
+      uint32_t now = HAL_GetTick();
+      bool mid = ir.black[IR_LEFT_MIDDLE] || ir.black[IR_RIGHT_MIDDLE];
+      bool branch = t_junction
+          ? (ir.black[IR_LEFTMOST] && ir.black[IR_RIGHTMOST] && mid)
+          : (ir.black[IR_RIGHTMOST] && mid && !ir.black[IR_LEFTMOST]);
+      branch = branch && now - t0 >= ignore_ms;
+      hits = branch ? hits + 1 : 0;
+      if (hits >= 2) {
+        if (!in_branch) count++;             /* a new branch */
+        in_branch = true;
+        last_branch = now;
+      } else if (in_branch && now - last_branch >= BRANCH_LOCKOUT_MS) {
+        in_branch = false;                   /* branch passed: ready for the next */
+      }
+    }
+    snprintf(shown, sizeof shown, "%s J%u", title, count);
+    key1_show(shown);
+  }
+  line_keep_right = false;                   /* back to normal centring */
+}
+
+/* The IR bar is ahead of the wheels: keep following slowly for AXLE_FWD_PULSES (J3
+ * encoder) so the wheels sit on the junction before pivoting. */
+static void to_axle(const char *phase, int32_t pulses) {
+  const ELCP_Motor_State_t *m3 = ELCP_Motor_GetState(MOTOR_J3);
+  int32_t p3 = m3->pulse_count;
+  uint32_t t = HAL_GetTick();
+  while (m3->pulse_count - p3 < pulses && HAL_GetTick() - t < AXLE_FWD_MAX_MS) {
+    line_drive(APPROACH_SPEED, LINE_TURN_RATIO * APPROACH_SPEED);
+    key1_show(phase);
+  }
+  ELCP_Motor_Stop(MOTOR_J1);
+  ELCP_Motor_Stop(MOTOR_J3);
+  HAL_Delay(200);
+}
+
+/* Two screen rows for a pivot's log: "R90 STOP 180" and the lines met "  95 180". */
+static void show_turn_log(unsigned row, const char *name, const TurnLog *l) {
+  tft_prints(0, row, "%s STOP %d", name, (int)l->stop);
+  char b[17] = " ";
+  int len = 1;
+  unsigned shown = l->n < TURN_LOG_MAX ? l->n : TURN_LOG_MAX;
+  for (unsigned i = 0; i < shown && len < 12; i++)
+    len += snprintf(b + len, sizeof b - len, " %d", (int)l->at[i]);
+  tft_prints(0, row + 1, "%s", l->n ? b : "  NO LINES");
+}
+
+static void key2(void) {
+  TurnLog r90 = {0}, turn = {0}, l90 = {0};
+  key_start(2);
+  follow_to_junction("K2 TOP", K2_BRANCH_N, false, 0.0f, false, BRANCH_IGNORE_MS);
+                                             /* east, until the 2nd branch on the right */
+  to_axle("K2 TO AXLE", AXLE_FWD_PULSES);
+  float side = pivot_to_line(-1.0f, TURN90_WIN_MIN, TURN90_WIN_MAX, true, &r90, "K2 RIGHT 90");
+  drive_to_wall("K2 TO KEY", side, KEY2_STOP_MM);
+  key_motion(2);
+  side = pivot_to_line(-1.0f, K2_TURN_WIN_MIN, K2_TURN_WIN_MAX, false, &turn, "K2 TURN");
+  /* Up to the top line: the mirror of the right turn at the start. Right-edge following
+   * (the diagonal splits off left), until the T = both outer sensors black. */
+  follow_to_junction("K2 UP", 1, true, side, true, 0);
+  to_axle("K2 TO AXLE", AXLE_FWD_PULSES);
+  side = pivot_to_line(1.0f, TURN90_WIN_MIN, TURN90_WIN_MAX, true, &l90, "K2 LEFT 90");
+  drive_to_goal(2, side);                    /* west to the start, like key 1 */
+
+  /* After the run: each pivot's stop and the lines it met, to set the windows. */
+  tft_prints(0, 0, "K2 DONE");
+  show_turn_log(1, "R90", &r90);
+  show_turn_log(3, "TURN", &turn);
+  show_turn_log(5, "L90", &l90);
+  tft_prints(0, 8, "90 WIN %d-%d", (int)TURN90_WIN_MIN, (int)TURN90_WIN_MAX);
+  tft_prints(0, 9, "TRN WIN %d-%d", (int)K2_TURN_WIN_MIN, (int)K2_TURN_WIN_MAX);
   tft_update(0);
   HAL_Delay(8000);
 }
@@ -508,19 +678,7 @@ int main(void)
       us_next = (us_next + 1) % ULTRASONIC_COUNT;
     }
     if (btn_read(BTN1)) key1();
-    if (btn_read(BTN2)) {
-      ELCP_Motor_SetSpeed(MOTOR_J1, 50.0f);    /* forward */
-      ELCP_Motor_SetSpeed(MOTOR_J3, 25.0f);
-      HAL_Delay(5000);
-      ELCP_Motor_Stop(MOTOR_J1);               /* stop */
-      ELCP_Motor_Stop(MOTOR_J3);
-      HAL_Delay(1000);
-      ELCP_Motor_SetSpeed(MOTOR_J1, -50.0f);   /* backward */
-      ELCP_Motor_SetSpeed(MOTOR_J3, -25.0f);
-      HAL_Delay(5000);
-      ELCP_Motor_Stop(MOTOR_J1);
-      ELCP_Motor_Stop(MOTOR_J3);
-    }
+    if (btn_read(BTN2)) key2();
 
     ELCP_Motor_UpdatePPS(MOTOR_J1);          /* refreshes pps/rpm once per second */
     ELCP_Motor_UpdatePPS(MOTOR_J3);
