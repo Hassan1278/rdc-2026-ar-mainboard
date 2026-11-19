@@ -115,6 +115,7 @@ static void key1_show(const char *phase) {
  *             stop when US1 (front) < US_STOP_MM twice in a row.
  * 3. PAUSE    1 s still, rear ultrasonics settle.
  * 4. SQUARE   turn on the spot until US2-US3 matches the start angle (for the key).
+ * 4b. HOOK    BTN2 only: ONE TURN, north-east to north until US2 == US3 (hooks the key).
  * 5. TURN     on the spot until the IR leaves the line, then until it finds it again.
  * 6. RETURN   exactly step 2 again: same line PID, same slow approach, same stop.
  * Line reading: middle sensors first, outer only if both middle are off,
@@ -128,7 +129,7 @@ static void key1_show(const char *phase) {
 #define LINE_DT_MS  5      /* steering update period, ms: small steps, often */
 #define LINE_SLEW   1.0f   /* max steering change per update, % (5 ms -> 0 to full turn in 100 ms) */
 #define LINE_TURN_MAX 8.0f /* steering limit: small, so it nearly drives straight */
-#define US_STOP_MM  90     /* stop this close to the wall ahead (key holder / start), 80-100 mm */
+#define US_STOP_MM  130     /* stop this close to the wall ahead (key holder / start), 80-100 mm */
 #define APPROACH_MM 400    /* inside this, slow down for a precise stop (IR stays on) */
 #define APPROACH_SPEED 15.0f /* speed inside APPROACH_MM */
 #define TURN_PAUSE_MS 1000 /* standstill before the turn */
@@ -138,6 +139,16 @@ static void key1_show(const char *phase) {
 #define ALIGN_SIGN  -1.0f  /* pivot direction; flip if it turns away from square (tested: -1) */
 #define ALIGN_TOL_MM 10    /* US2-US3 within this of the start difference = square */
 #define ALIGN_MAX_MS 3000  /* give up squaring after this */
+/* ONE TURN (BTN2, step 4b of key 1): Robot placed nose north-east, wall behind it. Turns on
+ * the spot in ONE fixed direction only, and stops as soon as the rear ultrasonics US2 and
+ * US3 read the same distance (or their difference changes sign = it passed square).
+ * It never reverses, so you can see clearly which way it turns. */
+#define ONE_TURN_DIR    -1.0f /* -1 = J1 backward, J3 forward. +1 = the other way.
+                               * 19 Nov test: +1 turned further right (clockwise).
+                               * North-east to north is anticlockwise, so -1. Flip if wrong. */
+#define ONE_TURN_SPEED  20.0f /* % pivot speed: J1 gets 2x = 40 %, J3 gets 20 %. 10 was too weak, one wheel stalled */
+#define ONE_TURN_TOL_MM 8     /* |US2-US3| under this = square, stop */
+#define ONE_TURN_MAX_MS 4000  /* safety: stop turning after this */
 #define US_EMA_A    0.5f   /* rear ultrasonic smoothing: 1 = none, smaller = smoother but slower */
 
 static float line_err;     /* -2 = line far left .. +2 = line far right; kept if the line is lost */
@@ -237,7 +248,53 @@ static void drive_to_wall(const char *phase) {
   ELCP_Motor_Stop(MOTOR_J3);
 }
 
-static void key1(void) {
+/* Turn on the spot: p > 0 = J1 forward, J3 backward. p < 0 = J1 backward, J3 forward. */
+static void pivot(float p) {
+  ELCP_Motor_SetSpeed(MOTOR_J1, J1_GAIN * p);
+  ELCP_Motor_SetSpeed(MOTOR_J3, J3_GAIN * -p);
+}
+
+/* ONE TURN: see the ONE_TURN_* defines. TFT title shows US2-US3 live while turning. */
+static void one_turn(uint32_t show_ms) {
+  char title[17];
+  rear_reset();
+  uint32_t t = HAL_GetTick();
+  while (HAL_GetTick() - t < 500) {          /* half a second: let US2 and US3 answer */
+    rear_poll();
+    key1_show("1TURN WAIT");
+  }
+
+  const char *result;
+  if (!rear_ok(0) || !rear_ok(1)) {
+    result = "1TURN NO ECHO";              /* a rear sensor sees no wall: do not move */
+  } else {
+    float start = rear[0] - rear[1];       /* US2 - US3 before turning */
+    result = "1TURN TIMEOUT";
+    t = HAL_GetTick();
+    while (HAL_GetTick() - t < ONE_TURN_MAX_MS) {
+      pivot(ONE_TURN_DIR * ONE_TURN_SPEED);  /* always the same direction */
+      if (rear_poll() && rear_ok(0) && rear_ok(1)) {
+        float d = rear[0] - rear[1];
+        if (d <= ONE_TURN_TOL_MM && d >= -ONE_TURN_TOL_MM) { result = "1TURN DONE EQUAL"; break; }
+        if ((start > 0) != (d > 0))                         { result = "1TURN DONE CROSS"; break; }
+      }
+      int d_now = (rear_ok(0) && rear_ok(1)) ? (int)(rear[0] - rear[1]) : 0;
+      snprintf(title, sizeof title, "1TURN d%+4d", d_now);
+      key1_show(title);
+    }
+  }
+  pivot(0);
+
+  t = HAL_GetTick();                       /* show the result for show_ms */
+  while (HAL_GetTick() - t < show_ms) {
+    rear_poll();
+    key1_show(result);
+  }
+}
+
+/* hook = true (BTN2): run ONE TURN right before the turn-around (the hooking motion).
+ * hook = false (BTN1): Hassan's key 1 exactly as he wrote it. */
+static void key1(bool hook) {
   uint32_t t = HAL_GetTick();                /* 1 s after the press before moving */
   rear_reset();
   while (HAL_GetTick() - t < 1000) {
@@ -279,6 +336,15 @@ static void key1(void) {
   ELCP_Motor_Stop(MOTOR_J1);
   ELCP_Motor_Stop(MOTOR_J3);
   HAL_Delay(200);
+
+  /* BTN2 only: the hooking motion. Turn on the spot from north-east to north until US2
+   * and US3 read the same (ONE_TURN_* settings), then Hassan's code carries on below. */
+  if (hook) {
+    one_turn(1000);
+    ELCP_Motor_Stop(MOTOR_J1);
+    ELCP_Motor_Stop(MOTOR_J3);
+    HAL_Delay(200);
+  }
 
   /* Turn around on the spot (J1 forward, J3 back): first until no IR sensor sees the
    * line (it has left it), then until a middle sensor finds it again, which is the
@@ -383,20 +449,8 @@ int main(void)
       us_mm[us_next] = Ultrasonic_ReadMm(us_next);
       us_next = (us_next + 1) % ULTRASONIC_COUNT;
     }
-    if (btn_read(BTN1)) key1();
-    if (btn_read(BTN2)) {
-      ELCP_Motor_SetSpeed(MOTOR_J1, 50.0f);    /* forward */
-      ELCP_Motor_SetSpeed(MOTOR_J3, 25.0f);
-      HAL_Delay(5000);
-      ELCP_Motor_Stop(MOTOR_J1);               /* stop */
-      ELCP_Motor_Stop(MOTOR_J3);
-      HAL_Delay(1000);
-      ELCP_Motor_SetSpeed(MOTOR_J1, -50.0f);   /* backward */
-      ELCP_Motor_SetSpeed(MOTOR_J3, -25.0f);
-      HAL_Delay(5000);
-      ELCP_Motor_Stop(MOTOR_J1);
-      ELCP_Motor_Stop(MOTOR_J3);
-    }
+    if (btn_read(BTN1)) key1(false);         /* Hassan's key 1, unchanged */
+    if (btn_read(BTN2)) key1(true);          /* Hassan's key 1 + ONE TURN hook before the turn-around */
 
     ELCP_Motor_UpdatePPS(MOTOR_J1);          /* refreshes pps/rpm once per second */
     ELCP_Motor_UpdatePPS(MOTOR_J3);
