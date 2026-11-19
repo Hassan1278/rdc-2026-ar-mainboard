@@ -20,7 +20,6 @@
 #include "main.h"
 #include "adc.h"
 #include "dma.h"
-#include "i2c.h"
 #include "spi.h"
 #include "tim.h"
 #include "usart.h"
@@ -115,7 +114,7 @@ static void key1(void) {
     line_drive(BASE_SPEED, LINE_K);
     if (HAL_GetTick() - last_us >= 60) {
       last_us = HAL_GetTick();
-      int32_t d = Ultrasonic_ReadMm();
+      int32_t d = Ultrasonic_ReadMm(0);   /* US1, front */
       close = (d >= 0 && d < US_STOP_MM) ? close + 1 : 0;
     }
   }
@@ -165,8 +164,9 @@ int main(void)
   MX_ADC1_Init();
   MX_ADC2_Init();
   MX_ADC3_Init();
-  MX_I2C1_Init();
   MX_TIM2_Init();
+  MX_TIM4_Init();
+  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
   /* Starts TIM12 CH1 / TIM8 CH2 PWM with both motors stopped (0 % duty). */
   ELCP_Motor_Init(MOTOR_J1);
@@ -181,15 +181,12 @@ int main(void)
   IR_Init(&ir, IR_DEFAULT_TRIGGER);
   boot_log((ir.ok[0] && ir.ok[1] && ir.ok[2] && ir.ok[3]) ? "IR OK" : "IR ADC FAIL");
 
-  boot_log(Ultrasonic_Start() == HAL_OK ? "US OK" : "US FAIL");
-
-  boot_log("TOF INIT...");
-  AR_ToFBoardInit();
-  boot_log(AR_ToFBoardStatus());
+  boot_log(Ultrasonic_Start() == HAL_OK ? "US x3 OK" : "US FAIL");
 
   HAL_Delay(1500);   /* keep the startup log on screen briefly */
   static const char *const ir_names[IR_COUNT] = {"LL", "LM", "RM", "RR"};
-  int32_t us_mm = -1;
+  int32_t us_mm[ULTRASONIC_COUNT] = {-1, -1, -1};
+  unsigned us_next = 0;
   uint32_t last_us = HAL_GetTick();
 
   /* USER CODE END 2 */
@@ -203,10 +200,12 @@ int main(void)
     /* USER CODE BEGIN 3 */
     /* Read sensors */
     IR_Update(&ir);
-    AR_ToFBoardPoll();
-    if (HAL_GetTick() - last_us >= 60) {   /* ultrasonic needs ~60 ms between pings */
+    /* Ultrasonics take turns, one every 30 ms (each every 90 ms), so they don't
+     * hear each other's echoes. */
+    if (HAL_GetTick() - last_us >= 30) {
       last_us = HAL_GetTick();
-      us_mm = Ultrasonic_ReadMm();
+      us_mm[us_next] = Ultrasonic_ReadMm(us_next);
+      us_next = (us_next + 1) % ULTRASONIC_COUNT;
     }
     if (btn_read(BTN1)) key1();
     if (btn_read(BTN2)) {
@@ -235,19 +234,11 @@ int main(void)
                  (int)ir.raw[i], (int)ir.trigger[i], state);
     }
 
-    /* Row 5: ultrasonic (front), result of the previous 60 ms ping */
-    if (us_mm < 0) tft_prints(0, 5, "US  NO ECHO");
-    else           tft_prints(0, 5, "US  %4d mm", (int)us_mm);
-
-    /* Row 6: rear ToFs, "----" = no reading */
-    int32_t t1 = AR_ToFBoardDistanceAt(0), t2 = AR_ToFBoardDistanceAt(1);
-    char t1s[12] = "----", t2s[12] = "----";
-    if (t1 >= 0) snprintf(t1s, sizeof t1s, "%4d", (int)t1);
-    if (t2 >= 0) snprintf(t2s, sizeof t2s, "%4d", (int)t2);
-    tft_prints(0, 6, "T1 %s T2 %s", t1s, t2s);
-
-    /* Row 7: ToF board status (TOF READY or the fault) */
-    tft_prints(0, 7, "%s", AR_ToFBoardStatus());
+    /* Rows 5-7: ultrasonics US1 (front), US2, US3 */
+    for (unsigned i = 0; i < ULTRASONIC_COUNT; i++) {
+      if (us_mm[i] < 0) tft_prints(0, 5 + i, "US%u NO ECHO", i + 1);
+      else              tft_prints(0, 5 + i, "US%u %4d mm", i + 1, (int)us_mm[i]);
+    }
 
     /* Rows 8-9: motors, commanded % and measured rpm */
     const ELCP_Motor_State_t *m1 = ELCP_Motor_GetState(MOTOR_J1);

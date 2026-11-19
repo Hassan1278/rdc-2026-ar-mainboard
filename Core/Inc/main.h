@@ -105,10 +105,14 @@ void Error_Handler(void);
 #define ELCP_J3_FB_EXTI_IRQn EXTI9_5_IRQn
 #define ELCP_J3_DIR_Pin GPIO_PIN_9
 #define ELCP_J3_DIR_GPIO_Port GPIOC
-#define AR_TOF_2_XSHUT_Pin GPIO_PIN_4
-#define AR_TOF_2_XSHUT_GPIO_Port GPIOB
-#define AR_TOF_1_XSHUT_Pin GPIO_PIN_5
-#define AR_TOF_1_XSHUT_GPIO_Port GPIOB
+#define US_TRIG3_Pin GPIO_PIN_4
+#define US_TRIG3_GPIO_Port GPIOB
+#define US_ECHO3_Pin GPIO_PIN_5
+#define US_ECHO3_GPIO_Port GPIOB
+#define US_TRIG2_Pin GPIO_PIN_6
+#define US_TRIG2_GPIO_Port GPIOB
+#define US_ECHO2_Pin GPIO_PIN_7
+#define US_ECHO2_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 #define __forceinline __attribute__((__always_inline__)) inline
