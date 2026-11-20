@@ -141,7 +141,7 @@ static void key1_show(const char *phase) {
 #define LINE_DT_MS  5      /* steering update period, ms: small steps, often */
 #define LINE_SLEW   1.0f   /* max steering change per update, % (5 ms -> 0 to full turn in 100 ms) */
 #define KEY1_STOP_MM 165   /* key 1: stop this far from the key holder */
-#define KEY2_STOP_MM 147   /* key 2: stop this far from the key holder */
+#define KEY2_STOP_MM 153   /* key 2: stop this far from the key holder */
 #define GOAL_STOP_MM 110   /* return leg: after the T, drive straight 2:1 and stop this
                             * far from the wall of the start zone (front ultrasonic) */
 #define GOAL_MAX_MS 8000   /* safety: stop the straight drive after this if US1 never trips */
