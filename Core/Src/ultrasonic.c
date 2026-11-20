@@ -1,29 +1,130 @@
 #include "ultrasonic.h"
+#include "tim.h"
 #include <stdbool.h>
-static bool dwt_ready;
-static uint32_t cyc_per_us;
-static inline uint32_t cyc(void) { return DWT->CYCCNT; }
-HAL_StatusTypeDef Ultrasonic_Start(void) {
-    gpio_reset(US_TRIG);
-    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-    DWT->CYCCNT=0; DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
-    cyc_per_us=HAL_RCC_GetHCLKFreq()/1000000u;
-    dwt_ready=cyc_per_us!=0;
-    return dwt_ready?HAL_OK:HAL_ERROR;
+
+#define US_MIN_US     100u    /* ~17 mm, shorter = noise */
+#define US_MAX_US     25000u  /* ~4.3 m; no-target pulses (~38 ms) are rejected */
+#define US_MAX_AGE_MS 250u    /* older results are reported as -1 */
+
+typedef enum { US_IDLE, US_WAIT_RISE, US_WAIT_FALL, US_DONE } us_state_t;
+
+typedef struct {
+    TIM_HandleTypeDef *tim;
+    uint32_t channel;              /* TIM_CHANNEL_x of the echo */
+    uint32_t active;               /* HAL_TIM_ACTIVE_CHANNEL_x, as seen in the callback */
+    uint32_t flag_cc, flag_ccof;   /* TIM_FLAG_CCx, TIM_FLAG_CCxOF */
+    GPIO_TypeDef *trig_port;
+    uint16_t trig_pin;
+    GPIO_TypeDef *echo_port;
+    uint16_t echo_pin;
+    uint32_t mask;                 /* counter width: 0xFFFFFFFF (TIM2) or 0xFFFF (TIM4) */
+    volatile us_state_t state;
+    volatile uint32_t rise_tick;   /* timer count at rising edge */
+    volatile uint32_t width_us;    /* echo high time */
+    uint32_t ping_ms;              /* HAL tick when the pending ping was fired */
+} us_sensor_t;
+
+static us_sensor_t us[ULTRASONIC_COUNT] = {
+    {&htim2, TIM_CHANNEL_2, HAL_TIM_ACTIVE_CHANNEL_2, TIM_FLAG_CC2, TIM_FLAG_CC2OF,
+     US_TRIG_GPIO_Port,  US_TRIG_Pin,  US_ECHO_GPIO_Port,  US_ECHO_Pin},
+    {&htim4, TIM_CHANNEL_4, HAL_TIM_ACTIVE_CHANNEL_4, TIM_FLAG_CC4, TIM_FLAG_CC4OF,
+     US_TRIG1_GPIO_Port, US_TRIG1_Pin, US_ECHO1_GPIO_Port, US_ECHO1_Pin},
+    {&htim2, TIM_CHANNEL_3, HAL_TIM_ACTIVE_CHANNEL_3, TIM_FLAG_CC3, TIM_FLAG_CC3OF,
+     US_TRIG2_GPIO_Port, US_TRIG2_Pin, US_ECHO2_GPIO_Port, US_ECHO2_Pin},
+};
+static bool started;
+
+static inline void set_polarity(us_sensor_t *s, uint32_t pol) {
+    __HAL_TIM_SET_CAPTUREPOLARITY(s->tim, s->channel, pol);
 }
-int32_t Ultrasonic_ReadMm(void)
+
+HAL_StatusTypeDef Ultrasonic_Start(void)
 {
-    if (!dwt_ready || !cyc_per_us) return -1;
-    if (gpio_read(US_ECHO) == GPIO_PIN_SET) return -1;        /* echo stuck high */
-    gpio_set(US_TRIG);
-    uint32_t t0 = cyc();
-    while ((cyc() - t0) < 15u * cyc_per_us) { }
-    gpio_reset(US_TRIG);
-    uint32_t t1 = cyc(), tmax = 6000u * cyc_per_us;
-    while (gpio_read(US_ECHO) == GPIO_PIN_RESET) { if ((cyc() - t1) > tmax) return -1; }
-    uint32_t r0 = cyc();
-    while (gpio_read(US_ECHO) == GPIO_PIN_SET) { if ((cyc() - t1) > tmax) return -1; }
-    uint32_t us = (cyc() - r0) / cyc_per_us;
-    if (us < 100u) return -1;
-    return (int32_t)((us * 343u) / 2000u);                    /* mm */
+    /* TIM2/TIM4 sit on APB1: their clock is PCLK1, x2 when the APB1 prescaler != 1
+     * (168 MHz SYSCLK, APB1 /4 -> 42 MHz PCLK1 -> 84 MHz timers). The .ioc value
+     * of 72-1 assumes a 72 MHz part, so set a 1 MHz tick from the real clock. */
+    uint32_t timclk = HAL_RCC_GetPCLK1Freq();
+    if ((RCC->CFGR & RCC_CFGR_PPRE1) != RCC_CFGR_PPRE1_DIV1) timclk *= 2u;
+    if (timclk < 1000000u) return HAL_ERROR;
+
+    for (unsigned i = 0; i < ULTRASONIC_COUNT; i++) {
+        us_sensor_t *s = &us[i];
+        HAL_GPIO_WritePin(s->trig_port, s->trig_pin, GPIO_PIN_RESET);
+
+        /* TIM2 is 32-bit (wraps after ~71 min); TIM4 is 16-bit (wraps every 65 ms,
+         * longer than any valid echo, so masked differences stay correct).
+         * TIM2 serves two sensors; setting it up twice is harmless. */
+        s->mask = IS_TIM_32B_COUNTER_INSTANCE(s->tim->Instance) ? 0xFFFFFFFFu : 0xFFFFu;
+        s->tim->Init.Prescaler = timclk / 1000000u - 1u;
+        s->tim->Init.Period    = s->mask;
+        __HAL_TIM_SET_PRESCALER(s->tim, s->tim->Init.Prescaler);
+        __HAL_TIM_SET_AUTORELOAD(s->tim, s->tim->Init.Period);
+        s->tim->Instance->EGR = TIM_EGR_UG;             /* load the prescaler now */
+        __HAL_TIM_CLEAR_FLAG(s->tim, TIM_FLAG_UPDATE | s->flag_cc | s->flag_ccof);
+
+        s->state = US_IDLE;
+        set_polarity(s, TIM_INPUTCHANNELPOLARITY_RISING);
+        if (HAL_TIM_IC_Start_IT(s->tim, s->channel) != HAL_OK) return HAL_ERROR;
+    }
+    started = true;
+    return HAL_OK;
+}
+
+int32_t Ultrasonic_ReadMm(unsigned i)
+{
+    if (!started || i >= ULTRASONIC_COUNT) return -1;
+    us_sensor_t *s = &us[i];
+
+    /* Collect the previous ping's result and drop any unfinished capture.
+     * IRQs off so the ISR can't change state between the read and the reset. */
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    us_state_t st = s->state;
+    uint32_t w = s->width_us;
+    s->state = US_IDLE;
+    set_polarity(s, TIM_INPUTCHANNELPOLARITY_RISING);
+    __HAL_TIM_CLEAR_FLAG(s->tim, s->flag_cc | s->flag_ccof);
+    __set_PRIMASK(primask);
+
+    int32_t mm = -1;
+    if (st == US_DONE && w >= US_MIN_US && w <= US_MAX_US
+        && (HAL_GetTick() - s->ping_ms) <= US_MAX_AGE_MS)
+        mm = (int32_t)((w * 343u) / 2000u);              /* 343 m/s, round trip */
+
+    /* Fire the next ping, unless echo is still high from a long no-target
+     * pulse (the sensor ignores triggers until it drops). The pin is in AF
+     * mode but IDR still reads its level. */
+    if (HAL_GPIO_ReadPin(s->echo_port, s->echo_pin) == GPIO_PIN_RESET) {
+        s->state = US_WAIT_RISE;                        /* arm before triggering */
+        HAL_GPIO_WritePin(s->trig_port, s->trig_pin, GPIO_PIN_SET);
+        uint32_t t0 = __HAL_TIM_GET_COUNTER(s->tim);
+        while (((__HAL_TIM_GET_COUNTER(s->tim) - t0) & s->mask) < 12u) { }  /* >= 10 us */
+        HAL_GPIO_WritePin(s->trig_port, s->trig_pin, GPIO_PIN_RESET);
+        s->ping_ms = HAL_GetTick();
+    }
+    return mm;
+}
+
+/* TIM2/TIM4 are the only input-capture timers, so this callback is defined here
+ * and dispatches by timer and channel. The ELCP motors use HAL_GPIO_EXTI_Callback
+ * (elcp_motor.c) and TIM8/TIM12 run PWM without interrupts. */
+void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
+{
+    for (unsigned i = 0; i < ULTRASONIC_COUNT; i++) {
+        us_sensor_t *s = &us[i];
+        if (s->tim != htim || htim->Channel != s->active) continue;
+
+        uint32_t t = HAL_TIM_ReadCapturedValue(htim, s->channel);
+        if (s->state == US_WAIT_RISE) {
+            s->rise_tick = t;
+            s->state = US_WAIT_FALL;
+            set_polarity(s, TIM_INPUTCHANNELPOLARITY_FALLING);
+        } else if (s->state == US_WAIT_FALL) {
+            s->width_us = (t - s->rise_tick) & s->mask;  /* masked math handles wrap */
+            s->state = US_DONE;
+            set_polarity(s, TIM_INPUTCHANNELPOLARITY_RISING);
+        }
+        /* US_IDLE / US_DONE: stray edge, ignore */
+        return;
+    }
 }
