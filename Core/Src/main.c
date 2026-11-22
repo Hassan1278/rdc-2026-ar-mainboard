@@ -129,25 +129,28 @@ static void key1_show(const char *phase) {
  * 5. TURN     right on the spot; a line seen inside TURN_WIN_MIN..TURN_WIN_MAX pulses
  *             is the straight path back: stop and follow it. Lines outside are ignored.
  * 6. RETURN   same line PID and steering cap as step 2, until all 4 IR see black (T-line),
- *             then straight ahead 2:1 into the start zone, stop at GOAL_STOP_MM (110 mm).
+ *             then straight ahead 2:1 into the start zone, stop at GOAL_STOP_MM (120 mm).
  * Line reading: middle sensors first, outer only if both middle are off,
  * 3+ black (junction) = straight, line lost = keep steering toward the last side.
  * ------------------------------------------------------------------------------------ */
-#define BASE_SPEED  25.0f  /* % before gearing; J1 gets 2x this */
+#define BASE_SPEED  20.0f  /* key 1 cruising speed, % before gearing; J1 gets 2x this */
+#define KEY2_SPEED  20.0f  /* key 2 cruising speed, on the way to the key */
+#define KEY2_RETURN_SPEED 15.0f /* key 2 cruising speed after the key (20 drove off the field) */
+#define START_MS    1000   /* both keys: first drive straight ahead 2:1 this long */
 #define J1_GAIN     2.0f   /* J1 needs ~2x J3 to drive straight */
 #define J3_GAIN     1.0f
-#define LINE_KP     -2.0f  /* steering toward the line (small steps); negative = J1 is the right wheel */
+#define LINE_KP     -2.5f  /* steering toward the line (small steps); negative = J1 is the right wheel */
 #define LINE_KD     -6.0f  /* damping: brakes the turn as the line comes back to centre. Same sign as LINE_KP */
 #define LINE_DT_MS  5      /* steering update period, ms: small steps, often */
 #define LINE_SLEW   1.0f   /* max steering change per update, % (5 ms -> 0 to full turn in 100 ms) */
-#define KEY1_STOP_MM 165   /* key 1: stop this far from the key holder */
-#define KEY2_STOP_MM 147   /* key 2: stop this far from the key holder */
-#define GOAL_STOP_MM 110   /* return leg: after the T, drive straight 2:1 and stop this
+#define KEY1_STOP_MM 161   /* key 1: stop this far from the key holder */
+#define KEY2_STOP_MM 149   /* key 2: stop this far from the key holder */
+#define GOAL_STOP_MM 120   /* return leg: after the T, drive straight 2:1 and stop this
                             * far from the wall of the start zone (front ultrasonic) */
 #define GOAL_MAX_MS 8000   /* safety: stop the straight drive after this if US1 never trips */
 #define GOAL_IGNORE_MS 500 /* return leg: ignore a T this soon after starting */
 #define RETURN_MAX_MS 30000   /* safety: stop the return leg if no T is ever found */
-#define LINE_TURN_RATIO 0.15f /* both legs are straight: steering at most 15% of the speed,
+#define LINE_TURN_RATIO 0.20f /* both legs are straight: steering at most 20% of the speed,
                               * so the two wheels can't differ enough to take a junction.
                               * Lower = straighter, but slower to correct a drift */
 #define APPROACH_MM 400    /* inside this, slow down for a precise stop (IR stays on) */
@@ -168,19 +171,32 @@ static void key1_show(const char *phase) {
 #define PULL_SPEED  15.0f  /* % speed for the small pullback before turning */
 #define PULL_MS     1000   /* how long to pull back before turning */
 #define K1_HOOK_LEFT_PULSES 8 /* small BTN2 left adjustment: 2/10 of 114 encoder pulses */
-#define K2_HOOK_LEFT_PULSES 23 /* small BTN2 left adjustment: 2/10 of 114 encoder pulses */
+#define K2_HOOK_LEFT_PULSES 26 /* small BTN2 left adjustment: 2/10 of 114 encoder pulses */
+#define K2_END_RIGHT_PULSES 26 /* end of key 2: turn right this many encoder pulses */
+#define K2_END_LEFT_PULSES 32  /* end of key 2: turn left this many (a bit more than right) */
+#define K2_END_BACK_MS 600     /* end of key 2: move back this long */
+#define K2_END_FWD_MS  650     /* end of key 2: move forward this long */
+#define K2_END_SPEED   15.0f   /* end of key 2: speed for the back / forward moves */
+#define K1_END_RIGHT_PULSES 16 /* end of key 1: the same sequence, ~60 % of key 2's values */
+#define K1_END_LEFT_PULSES  16
+#define K1_END_BACK_MS 360
+#define K1_END_FWD_MS  390
 
 /* Key 2 */
 #define K2_BRANCH_N 2      /* turn right at this branch on the right (2nd = the D's line) */
 #define BRANCH_LOCKOUT_MS 300 /* a branch counts once: next one only after this long
                                * without branch readings */
-#define BRANCH_IGNORE_MS 500  /* ignore branches this soon after the start (start zone) */
+#define BRANCH_IGNORE_MS 0    /* ignore branches this soon after the start: 0 = off, the
+                              * 0.5 s straight start (START_MS) already leaves the start zone */
 #define BRANCH_MAX_MS 30000   /* safety: give up counting after this */
 #define AXLE_FWD_PULSES 80 /* IR bar -> wheel axle, in J3 encoder pulses: drive this far
                             * past the junction before pivoting. CALIBRATE */
 #define AXLE_FWD_MAX_MS 3000  /* safety for that move */
 #define TURN90_WIN_MIN 100 /* 90 deg pivots at the junctions: the new line is the only one */
 #define TURN90_WIN_MAX 320 /* in this window of pulses. CALIBRATE from the end screen */
+#define K2_T_WIN_MIN 160   /* the turn at the T on the way back: own window, the 90 deg
+                            * one shifted 60 pulses (it came out angled) */
+#define K2_T_WIN_MAX 380
 #define K2_TURN_WIN_MIN 330 /* turn-around at the key 2 holder: the R's diagonal comes ~45 deg */
 #define K2_TURN_WIN_MAX 480 /* before the vertical line, so MIN must be above the diagonal's
                              * count. CALIBRATE from the end screen's TURN line */
@@ -191,6 +207,7 @@ static unsigned line_hi;
 static float line_turn;
 static uint32_t line_ms;
 static bool line_keep_right; /* right-edge mode: at a split, take the right-hand line */
+static float drive_speed = BASE_SPEED;  /* cruising speed of the current key, set in key_start */
 
 /* Fresh steering state, before each drive. */
 static void line_reset(void) {
@@ -290,6 +307,19 @@ static void pivot_pulses(int32_t pulses, float dir, float speed, const char *pha
   HAL_Delay(200);
 }
 
+/* Straight at the plain 2:1 ratio for ms (speed > 0 forward, < 0 back), then stop. */
+static void drive_timed(float speed, uint32_t ms, const char *phase) {
+  uint32_t t = HAL_GetTick();
+  while (HAL_GetTick() - t < ms) {
+    ELCP_Motor_SetSpeed(MOTOR_J1, J1_GAIN * speed);
+    ELCP_Motor_SetSpeed(MOTOR_J3, J3_GAIN * speed);
+    key1_show(phase);
+  }
+  ELCP_Motor_Stop(MOTOR_J1);
+  ELCP_Motor_Stop(MOTOR_J3);
+  HAL_Delay(200);
+}
+
 /* "K<k> <what>" for the screen title. One shared buffer: use the result right away. */
 static const char *ph(int k, const char *what) {
   static char b[17];
@@ -312,7 +342,7 @@ static void drive_to_wall(const char *phase, float start_err, int32_t stop_mm) {
   line_start(start_err);
   int close = 0;
   uint32_t last_us = 0;
-  float speed = BASE_SPEED;
+  float speed = drive_speed;
   while (close < 2) {
     line_drive(speed, LINE_TURN_RATIO * speed);
     if (HAL_GetTick() - last_us >= 60) {
@@ -335,7 +365,7 @@ static void follow_to_T(const char *phase, float start_err, uint32_t ignore_ms) 
   uint32_t t0 = HAL_GetTick(), seen_read = 0;
   int t_hits = 0;
   while (HAL_GetTick() - t0 < RETURN_MAX_MS) {
-    line_drive(BASE_SPEED, LINE_TURN_RATIO * BASE_SPEED);
+    line_drive(drive_speed, LINE_TURN_RATIO * drive_speed);
     if (line_ms != seen_read) {              /* a fresh IR reading (every LINE_DT_MS) */
       seen_read = line_ms;
       bool all = ir.black[IR_LEFTMOST] && ir.black[IR_LEFT_MIDDLE] &&
@@ -352,7 +382,7 @@ static void follow_to_T(const char *phase, float start_err, uint32_t ignore_ms) 
 static void straight_to_wall(const char *phase, int32_t stop_mm) {
   uint32_t t = HAL_GetTick(), last_us = 0;
   int close = 0;
-  float speed = BASE_SPEED;
+  float speed = drive_speed;
   while (close < 2 && HAL_GetTick() - t < GOAL_MAX_MS) {
     ELCP_Motor_SetSpeed(MOTOR_J1, J1_GAIN * speed);
     ELCP_Motor_SetSpeed(MOTOR_J3, J3_GAIN * speed);
@@ -445,9 +475,19 @@ static float pivot_to_line(float dir, int32_t win_min, int32_t win_max, bool nee
 
 /* 1 s still after the button press. */
 static void key_start(int k) {
+  drive_speed = (k == 2) ? KEY2_SPEED : BASE_SPEED;
   pulses_shown = -1;
   uint32_t t = HAL_GetTick();
   while (HAL_GetTick() - t < 1000) key1_show(ph(k, "START"));
+
+  /* Then straight ahead at the plain 2:1 ratio (no line following) for START_MS.
+   * The motors keep running into the line following that comes next. */
+  t = HAL_GetTick();
+  while (HAL_GetTick() - t < START_MS) {
+    ELCP_Motor_SetSpeed(MOTOR_J1, J1_GAIN * drive_speed);
+    ELCP_Motor_SetSpeed(MOTOR_J3, J3_GAIN * drive_speed);
+    key1_show(ph(k, "GO"));
+  }
 }
 
 /* At the key holder: stand still, turn right RIGHT_DEG, pull back a little. */
@@ -477,6 +517,13 @@ static void key1(void) {
   TurnLog turn;
   float side = pivot_to_line(-1.0f, TURN_WIN_MIN, TURN_WIN_MAX, false, &turn, "K1 TURN");
   drive_to_goal(1, side);
+
+  /* End of key 1, after the final stop: a bit right, back, left, forward (smaller
+   * than key 2's). */
+  pivot_pulses(K1_END_RIGHT_PULSES, -1.0f, PIVOT_SPEED, "K1 END RIGHT");
+  drive_timed(-K2_END_SPEED, K1_END_BACK_MS, "K1 END BACK");
+  pivot_pulses(K1_END_LEFT_PULSES, 1.0f, PIVOT_SPEED, "K1 END LEFT");
+  drive_timed(K2_END_SPEED, K1_END_FWD_MS, "K1 END FWD");
 
   /* After the run: where the turn met lines, to set the window around the straight
    * path's count (and away from the junction branch's). */
@@ -517,7 +564,7 @@ static void follow_to_junction(const char *title, unsigned n, bool t_junction,
   bool in_branch = false;
   char shown[17];
   while (count < n && HAL_GetTick() - t0 < BRANCH_MAX_MS) {
-    line_drive(BASE_SPEED, LINE_TURN_RATIO * BASE_SPEED);
+    line_drive(drive_speed, LINE_TURN_RATIO * drive_speed);
     if (line_ms != seen_read) {              /* a fresh IR reading */
       seen_read = line_ms;
       uint32_t now = HAL_GetTick();
@@ -576,13 +623,20 @@ static void key2(void) {
   float side = pivot_to_line(-1.0f, TURN90_WIN_MIN, TURN90_WIN_MAX, true, &r90, "K2 RIGHT 90");
   drive_to_wall("K2 TO KEY", side, KEY2_STOP_MM);
   key_motion(2);
+  drive_speed = KEY2_RETURN_SPEED;           /* slower for the whole way back */
   side = pivot_to_line(-1.0f, K2_TURN_WIN_MIN, K2_TURN_WIN_MAX, false, &turn, "K2 TURN");
   /* Up to the top line: the mirror of the right turn at the start. Right-edge following
    * (the diagonal splits off left), until the T = both outer sensors black. */
   follow_to_junction("K2 UP", 1, true, side, true, 0);
   to_axle("K2 TO AXLE", AXLE_FWD_PULSES);
-  side = pivot_to_line(1.0f, TURN90_WIN_MIN, TURN90_WIN_MAX, true, &l90, "K2 LEFT 90");
+  side = pivot_to_line(1.0f, K2_T_WIN_MIN, K2_T_WIN_MAX, true, &l90, "K2 LEFT 90");
   drive_to_goal(2, side);                    /* west to the start, like key 1 */
+
+  /* End of key 2, after the final stop: a bit right, back, left, forward. */
+  pivot_pulses(K2_END_RIGHT_PULSES, -1.0f, PIVOT_SPEED, "K2 END RIGHT");
+  drive_timed(-K2_END_SPEED, K2_END_BACK_MS, "K2 END BACK");
+  pivot_pulses(K2_END_LEFT_PULSES, 1.0f, PIVOT_SPEED, "K2 END LEFT");
+  drive_timed(K2_END_SPEED, K2_END_FWD_MS, "K2 END FWD");
 
   /* After the run: each pivot's stop and the lines it met, to set the windows. */
   tft_prints(0, 0, "K2 DONE");

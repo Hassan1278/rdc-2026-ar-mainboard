@@ -10,7 +10,7 @@
  *                 PC3 Middleright_IR ADC1_IN13
  *                 PC2 Rightmost_IR   ADC2_IN12
  * Readings are 12-bit ADC counts (0..4095). */
-#define IR_DEFAULT_TRIGGER 1000u /* black/white threshold, ADC counts */
+#define IR_DEFAULT_TRIGGER 400u  /* black/white threshold, ADC counts */
 /* 0: reading below trigger = black. 1: reading at/above trigger = black. */
 #define IR_BLACK_IS_HIGH 1
 
